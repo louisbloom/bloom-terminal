@@ -210,6 +210,31 @@ static bool check_colr_table(FT_Face face)
     return false;
 }
 
+// Check and load COLR palette (not implemented fully yet)
+static bool load_colr_palette(FtFontData *ft_data)
+{
+    if (!ft_data)
+        return false;
+
+    // Placeholder: don't load a palette yet. Leave palette NULL so we fall back to grayscale rendering.
+    ft_data->palette = NULL;
+    ft_data->palette_size = 0;
+    return false;
+}
+
+// Render COLR glyph layers into RGBA bitmap (not implemented yet)
+static GlyphBitmap *render_colr_glyph(FtFontData *ft_data, FT_UInt glyph_index,
+                                      uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    (void)ft_data;
+    (void)glyph_index;
+    (void)fg_r;
+    (void)fg_g;
+    (void)fg_b;
+    // Not implemented: return NULL to indicate no COLR rendering available
+    return NULL;
+}
+
 // Initialize FreeType/Cairo font
 static void *ft_init_font(Font *font, const char *font_path,
                           float font_size, FontStyle style, const FontOptions *options)
@@ -303,6 +328,13 @@ static void *ft_init_font(Font *font, const char *font_path,
 
     // Check for COLR table
     ft_data->has_colr = check_colr_table(ft_data->ft_face);
+    if (ft_data->has_colr) {
+        if (load_colr_palette(ft_data)) {
+            vlog("Loaded COLR palette for %s\n", font_path);
+        } else {
+            vlog("COLR palette not loaded for %s; color glyphs will use grayscale fallback\n", font_path);
+        }
+    }
 
     // Apply font variations based on style
     apply_font_variations(ft_data, style);
@@ -663,6 +695,14 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
 {
     if (!ft_data || !ft_data->ft_face)
         return NULL;
+
+    // Handle COLR color glyphs if supported (best-effort)
+    if (ft_data->has_colr && FT_HAS_COLOR(ft_data->ft_face)) {
+        GlyphBitmap *colr = render_colr_glyph(ft_data, glyph_index, fg_r, fg_g, fg_b);
+        if (colr)
+            return colr;
+        // Otherwise fall back to grayscale rasterization below
+    }
 
     FT_Face face = ft_data->ft_face;
 
