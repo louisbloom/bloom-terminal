@@ -109,20 +109,52 @@ static void ft_free_glyph_bitmap(Font *font, GlyphBitmap *bitmap)
     free(bitmap);
 }
 
-// Apply font variations based on style
+// Cache MM_Var and axis info for a face
+static void cache_mm_var(FtFontData *ft_data)
+{
+    if (!ft_data || !ft_data->ft_face)
+        return;
+
+    if (ft_data->mm_var)
+        return; // already cached
+
+    FT_MM_Var *mm_var = NULL;
+    FT_Error err = FT_Get_MM_Var(ft_data->ft_face, &mm_var);
+    if (err != 0 || !mm_var)
+        return;
+
+    ft_data->mm_var = mm_var;
+    ft_data->num_axes = (int)mm_var->num_axis;
+
+    ft_data->axes = calloc(mm_var->num_axis, sizeof(*ft_data->axes));
+    if (!ft_data->axes) {
+        FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
+        ft_data->mm_var = NULL;
+        ft_data->num_axes = 0;
+        return;
+    }
+
+    for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
+        ft_data->axes[i].tag = mm_var->axis[i].tag;
+        ft_data->axes[i].min_value = (float)mm_var->axis[i].minimum / 65536.0f;
+        ft_data->axes[i].default_value = (float)mm_var->axis[i].def / 65536.0f;
+        ft_data->axes[i].max_value = (float)mm_var->axis[i].maximum / 65536.0f;
+        ft_data->axes[i].current_value = ft_data->axes[i].default_value;
+        // axis name resolution omitted for brevity
+    }
+}
+
+// Apply font variations based on style (uses cached mm_var)
 static void apply_font_variations(FtFontData *ft_data, FontStyle style)
 {
     if (!ft_data || !ft_data->ft_face)
         return;
 
-    // Check if the font is a variable font by looking for axes
-    FT_MM_Var *mm_var = NULL;
-    FT_Error ft_error = FT_Get_MM_Var(ft_data->ft_face, &mm_var);
-    if (ft_error != 0 || !mm_var) {
-        vlog("Font is not a variable font or failed to get MM_Var, skipping variations\n");
-        return;
-    }
+    cache_mm_var(ft_data);
+    if (!ft_data->mm_var)
+        return; // not variable
 
+    FT_MM_Var *mm_var = ft_data->mm_var;
     vlog("Font is a variable font with %d axes\n", mm_var->num_axis);
 
     // Store weight information for later use
@@ -145,37 +177,31 @@ static void apply_font_variations(FtFontData *ft_data, FontStyle style)
     // Create an array of design coordinates for all axes
     FT_Fixed *coords = malloc(mm_var->num_axis * sizeof(FT_Fixed));
     if (!coords) {
-        FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
         vlog("Failed to allocate memory for font variations\n");
         return;
     }
 
-    // Initialize all coordinates to their default values
+    // Initialize all coordinates to their default or cached current values
     for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
-        coords[i] = mm_var->axis[i].def;
+        float val = ft_data->axes ? ft_data->axes[i].current_value : (float)mm_var->axis[i].def / 65536.0f;
+        coords[i] = (FT_Fixed)(val * 65536.0f);
     }
 
-    // Handle bold style
+    // Handle bold style by nudging 'wght' if available
     if (style == FONT_STYLE_BOLD) {
-        // Try to find the 'wght' (weight) axis
         for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
             if (mm_var->axis[i].tag == FT_MAKE_TAG('w', 'g', 'h', 't')) {
-                // Dynamically calculate bold weight based on font's axis range
-                // Use a distinguishable weight that's closer to max than default
                 float default_weight = (float)mm_var->axis[i].def / 65536.0f;
                 float min_weight = (float)mm_var->axis[i].minimum / 65536.0f;
                 float max_weight = (float)mm_var->axis[i].maximum / 65536.0f;
-
-                // If we have a reasonable range, calculate a bold weight
                 if (max_weight > default_weight && max_weight - min_weight > 100.0) {
-                    // Calculate bold weight as 90% of the way from default to max for more dramatic difference
                     float bold_weight = default_weight + (max_weight - default_weight) * 0.9f;
                     coords[i] = (FT_Fixed)(bold_weight * 65536.0f);
-                    vlog("Set 'wght' axis to %f for bold style (min: %f, default: %f, max: %f) - using 90%% of range\n",
-                         bold_weight, min_weight, default_weight, max_weight);
+                    ft_data->axes[i].current_value = bold_weight;
+                    vlog("Set 'wght' axis to %f for bold style\n", bold_weight);
                 } else {
-                    // Fallback to traditional bold weight
                     coords[i] = (FT_Fixed)(700.0f * 65536.0f);
+                    ft_data->axes[i].current_value = 700.0f;
                     vlog("Set 'wght' axis to 700.0 (fallback) for bold style\n");
                 }
                 break;
@@ -183,16 +209,17 @@ static void apply_font_variations(FtFontData *ft_data, FontStyle style)
         }
     }
 
-    // Apply the design coordinates to the FreeType face
-    ft_error = FT_Set_Var_Design_Coordinates(ft_data->ft_face, mm_var->num_axis, coords);
+    // Apply coordinates to FreeType
+    FT_Error ft_error = FT_Set_Var_Design_Coordinates(ft_data->ft_face, mm_var->num_axis, coords);
     if (ft_error == 0) {
         vlog("Successfully applied FreeType design coordinates\n");
+        if (ft_data->hb_font)
+            hb_ft_font_changed(ft_data->hb_font);
     } else {
         vlog("Failed to apply FreeType design coordinates: error %d\n", ft_error);
     }
 
     free(coords);
-    FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
 }
 
 // Check for COLR table in the font
@@ -210,29 +237,223 @@ static bool check_colr_table(FT_Face face)
     return false;
 }
 
-// Check and load COLR palette (not implemented fully yet)
+// Check and load COLR palette
 static bool load_colr_palette(FtFontData *ft_data)
 {
-    if (!ft_data)
+    if (!ft_data || !ft_data->ft_face)
         return false;
 
-    // Placeholder: don't load a palette yet. Leave palette NULL so we fall back to grayscale rendering.
-    ft_data->palette = NULL;
-    ft_data->palette_size = 0;
-    return false;
+    FT_Palette_Data palette_data;
+    FT_Error err = FT_Palette_Data_Get(ft_data->ft_face, &palette_data);
+    if (err != 0)
+        return false;
+
+    if (palette_data.num_palette_entries == 0)
+        return false;
+
+    FT_Color *palette = NULL;
+    err = FT_Palette_Select(ft_data->ft_face, 0, &palette);
+    if (err != 0 || !palette)
+        return false;
+
+    // FT provides palette pointer ownership; store for read-only use
+    ft_data->palette = palette;
+    ft_data->palette_size = palette_data.num_palette_entries;
+    return true;
 }
 
-// Render COLR glyph layers into RGBA bitmap (not implemented yet)
+// Render COLR glyph layers into RGBA bitmap
 static GlyphBitmap *render_colr_glyph(FtFontData *ft_data, FT_UInt glyph_index,
                                       uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
 {
-    (void)ft_data;
-    (void)glyph_index;
-    (void)fg_r;
-    (void)fg_g;
-    (void)fg_b;
-    // Not implemented: return NULL to indicate no COLR rendering available
-    return NULL;
+    if (!ft_data || !ft_data->ft_face)
+        return NULL;
+
+    FT_Face face = ft_data->ft_face;
+
+    // Get advance from base glyph if available
+    int advance = 0;
+    if (FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT) == 0) {
+        advance = (int)(face->glyph->advance.x >> 6);
+    }
+
+    // Iterate layers
+    FT_LayerIterator iterator;
+    iterator.p = NULL;
+    FT_UInt layer_glyph = 0;
+    FT_UInt layer_color_index = 0;
+
+    typedef struct
+    {
+        FT_Bitmap bmp;
+        int left;
+        int top;
+        FT_Color color;
+    } LayerBmp;
+    LayerBmp *layers = NULL;
+    int layer_count = 0;
+
+    while (FT_Get_Color_Glyph_Layer(face, glyph_index, &layer_glyph, &layer_color_index, &iterator)) {
+        if (layer_glyph == 0)
+            break;
+
+        FT_Int32 load_flags = FT_LOAD_DEFAULT;
+        if (ft_data->antialias)
+            load_flags |= FT_LOAD_TARGET_NORMAL;
+        else
+            load_flags |= FT_LOAD_TARGET_MONO;
+
+        if (FT_Load_Glyph(face, layer_glyph, load_flags) != 0)
+            continue;
+        if (FT_Render_Glyph(face->glyph, ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO) != 0)
+            continue;
+
+        FT_Bitmap *bmp = &face->glyph->bitmap;
+        int left = face->glyph->bitmap_left;
+        int top = face->glyph->bitmap_top;
+
+        LayerBmp *nl = realloc(layers, sizeof(LayerBmp) * (layer_count + 1));
+        if (!nl)
+            break;
+        layers = nl;
+
+        LayerBmp *lb = &layers[layer_count];
+        memset(lb, 0, sizeof(LayerBmp));
+
+        lb->bmp = *bmp;
+        size_t buf_size = (size_t)bmp->rows * (size_t)bmp->pitch;
+        lb->bmp.buffer = malloc(buf_size);
+        if (!lb->bmp.buffer)
+            break;
+        memcpy(lb->bmp.buffer, bmp->buffer, buf_size);
+        lb->left = left;
+        lb->top = top;
+
+        // Determine color (FT_Color is BGRA)
+        FT_Color c = { 0, 0, 0, 255 };
+        if (layer_color_index == 0xFFFF) {
+            c.red = fg_r;
+            c.green = fg_g;
+            c.blue = fg_b;
+            c.alpha = 255;
+        } else if (ft_data->palette && layer_color_index < ft_data->palette_size) {
+            c = ft_data->palette[layer_color_index];
+        }
+        lb->color = c;
+
+        layer_count++;
+    }
+
+    if (layer_count == 0) {
+        if (layers)
+            free(layers);
+        return NULL;
+    }
+
+    // Compute bounding box
+    int min_x = INT_MAX, min_y = INT_MAX, max_x = INT_MIN, max_y = INT_MIN;
+    for (int i = 0; i < layer_count; i++) {
+        LayerBmp *lb = &layers[i];
+        int l = lb->left;
+        int t = lb->top - lb->bmp.rows;
+        int r = lb->left + lb->bmp.width;
+        int b = lb->top;
+        if (l < min_x)
+            min_x = l;
+        if (t < min_y)
+            min_y = t;
+        if (r > max_x)
+            max_x = r;
+        if (b > max_y)
+            max_y = b;
+    }
+
+    int out_w = max_x - min_x;
+    int out_h = max_y - min_y;
+    if (out_w <= 0 || out_h <= 0) {
+        for (int i = 0; i < layer_count; i++)
+            free(layers[i].bmp.buffer);
+        free(layers);
+        return NULL;
+    }
+
+    GlyphBitmap *out = malloc(sizeof(GlyphBitmap));
+    if (!out) {
+        for (int i = 0; i < layer_count; i++)
+            free(layers[i].bmp.buffer);
+        free(layers);
+        return NULL;
+    }
+    out->width = out_w;
+    out->height = out_h;
+    out->x_offset = min_x;
+    out->y_offset = max_y; // baseline distance
+    out->advance = advance;
+    out->pixels = calloc(out_w * out_h, 4);
+    if (!out->pixels) {
+        free(out);
+        for (int i = 0; i < layer_count; i++)
+            free(layers[i].bmp.buffer);
+        free(layers);
+        return NULL;
+    }
+
+    // Composite layers (palette FT_Color is BGRA)
+    for (int i = 0; i < layer_count; i++) {
+        LayerBmp *lb = &layers[i];
+        FT_Bitmap *bmp = &lb->bmp;
+        int ox = lb->left - min_x;
+        int oy = max_y - lb->top;
+        uint8_t pr = lb->color.red;
+        uint8_t pg = lb->color.green;
+        uint8_t pb = lb->color.blue;
+        uint8_t pa = lb->color.alpha;
+
+        for (int y = 0; y < bmp->rows; y++) {
+            unsigned char *src = bmp->buffer + y * bmp->pitch;
+            for (int x = 0; x < bmp->width; x++) {
+                unsigned char a = src[x];
+                if (a == 0)
+                    continue;
+                int dx = ox + x;
+                int dy = oy + y;
+                if (dx < 0 || dx >= out_w || dy < 0 || dy >= out_h)
+                    continue;
+
+                uint8_t src_a = (uint8_t)((a * pa) / 255);
+                uint8_t *dst = &out->pixels[(dy * out_w + dx) * 4];
+                uint8_t dst_r = dst[0], dst_g = dst[1], dst_b = dst[2], dst_a = dst[3];
+
+                float sa = src_a / 255.0f;
+                float da = dst_a / 255.0f;
+                float outa = sa + da * (1.0f - sa);
+                if (outa <= 0.0f)
+                    continue;
+
+                float sr = pr / 255.0f;
+                float sg = pg / 255.0f;
+                float sb = pb / 255.0f;
+                float dr = dst_r / 255.0f;
+                float dg = dst_g / 255.0f;
+                float db = dst_b / 255.0f;
+
+                float rr = (sr * sa + dr * da * (1.0f - sa)) / outa;
+                float rg = (sg * sa + dg * da * (1.0f - sa)) / outa;
+                float rb = (sb * sa + db * da * (1.0f - sa)) / outa;
+
+                dst[0] = (uint8_t)(rr * 255.0f);
+                dst[1] = (uint8_t)(rg * 255.0f);
+                dst[2] = (uint8_t)(rb * 255.0f);
+                dst[3] = (uint8_t)(outa * 255.0f);
+            }
+        }
+    }
+
+    for (int i = 0; i < layer_count; i++)
+        free(layers[i].bmp.buffer);
+    free(layers);
+
+    return out;
 }
 
 // Initialize FreeType/Cairo font
@@ -356,6 +577,16 @@ static void ft_destroy_font(Font *font, void *font_data)
     if (ft_data->hb_font) {
         hb_font_destroy(ft_data->hb_font);
         ft_data->hb_font = NULL;
+    }
+
+    if (ft_data->mm_var) {
+        // Free cached MM_Var
+        FT_Done_MM_Var(ft_data->ft_face->glyph->library, ft_data->mm_var);
+        ft_data->mm_var = NULL;
+    }
+    if (ft_data->axes) {
+        free(ft_data->axes);
+        ft_data->axes = NULL;
     }
 
     if (ft_data->ft_face) {
@@ -875,45 +1106,77 @@ static bool ft_set_variation_axis(Font *font, void *font_data, const char *axis_
 {
     (void)font;
     FtFontData *ft_data = (FtFontData *)font_data;
-    if (!ft_data || !ft_data->ft_face || !axis_tag)
+    if (!ft_data || !ft_data->ft_face || !axis_tag || strlen(axis_tag) < 4)
         return false;
 
-    if (strlen(axis_tag) < 4)
+    cache_mm_var(ft_data);
+    if (!ft_data->mm_var)
         return false;
 
-    FT_MM_Var *mm_var = NULL;
-    FT_Error err = FT_Get_MM_Var(ft_data->ft_face, &mm_var);
-    if (err != 0 || !mm_var)
-        return false;
-
+    FT_MM_Var *mm_var = ft_data->mm_var;
     FT_Fixed *coords = malloc(mm_var->num_axis * sizeof(FT_Fixed));
-    if (!coords) {
-        FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
+    if (!coords)
         return false;
-    }
 
     for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
-        coords[i] = mm_var->axis[i].def;
+        coords[i] = (FT_Fixed)(ft_data->axes ? ft_data->axes[i].current_value * 65536.0f : mm_var->axis[i].def);
     }
 
     FT_ULong tag = FT_MAKE_TAG(axis_tag[0], axis_tag[1], axis_tag[2], axis_tag[3]);
     for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
         if (mm_var->axis[i].tag == tag) {
             coords[i] = (FT_Fixed)(value * 65536.0f);
+            if (ft_data->axes)
+                ft_data->axes[i].current_value = value;
             break;
         }
     }
 
-    err = FT_Set_Var_Design_Coordinates(ft_data->ft_face, mm_var->num_axis, coords);
+    FT_Error err = FT_Set_Var_Design_Coordinates(ft_data->ft_face, mm_var->num_axis, coords);
     free(coords);
-    FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
 
     if (err == 0) {
         if (ft_data->hb_font)
             hb_ft_font_changed(ft_data->hb_font);
         return true;
     }
+    return false;
+}
 
+// Set multiple variation axis coordinates
+static bool ft_set_variation_axes(Font *font, void *font_data, float *coords_in, int num_coords)
+{
+    (void)font;
+    FtFontData *ft_data = (FtFontData *)font_data;
+    if (!ft_data || !ft_data->ft_face || !coords_in || num_coords <= 0)
+        return false;
+
+    cache_mm_var(ft_data);
+    if (!ft_data->mm_var)
+        return false;
+
+    FT_MM_Var *mm_var = ft_data->mm_var;
+    int axes = mm_var->num_axis;
+    FT_Fixed *coords = malloc(axes * sizeof(FT_Fixed));
+    if (!coords)
+        return false;
+
+    // Fill coordinates from input; if fewer provided, use defaults for remaining
+    for (int i = 0; i < axes; i++) {
+        float val = (i < num_coords) ? coords_in[i] : (float)mm_var->axis[i].def / 65536.0f;
+        coords[i] = (FT_Fixed)(val * 65536.0f);
+        if (ft_data->axes)
+            ft_data->axes[i].current_value = val;
+    }
+
+    FT_Error err = FT_Set_Var_Design_Coordinates(ft_data->ft_face, axes, coords);
+    free(coords);
+
+    if (err == 0) {
+        if (ft_data->hb_font)
+            hb_ft_font_changed(ft_data->hb_font);
+        return true;
+    }
     return false;
 }
 
@@ -961,6 +1224,7 @@ Font font = {
     .render_glyphs = ft_render_glyph,            // Unified renderer (single codepoint)
     .render_shaped = ft_render_shaped,           // HarfBuzz-shaped multi-codepoint runs
     .set_variation_axis = ft_set_variation_axis, // Variable font control
+    .set_variation_axes = ft_set_variation_axes, // Set multiple axes
     .get_glyph_info = ft_get_glyph_info,
     .free_glyph_bitmap = ft_free_glyph_bitmap,
     .load_font = font_load_font,

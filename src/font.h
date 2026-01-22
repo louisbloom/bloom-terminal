@@ -104,6 +104,10 @@ struct Font
     bool (*set_variation_axis)(Font *font, void *font_data,
                                const char *axis_tag, float value);
 
+    // NEW: Set multiple axes at once
+    bool (*set_variation_axes)(Font *font, void *font_data,
+                               float *coords, int num_coords);
+
     // Get glyph metrics without rendering
     bool (*get_glyph_info)(Font *font, void *font_data, uint32_t codepoint,
                            int *advance, int *left_bearing, int *top_bearing);
@@ -140,6 +144,10 @@ ShapedGlyphs *font_render_shaped_text(Font *font, FontStyle style,
 // NEW: Set variable font axis value
 bool font_set_variation_axis(Font *font, FontStyle style,
                              const char *axis_tag, float value);
+
+// NEW: Set multiple axis coordinates at once
+bool font_set_variation_axes(Font *font, FontStyle style,
+                             float *coords, int num_coords);
 
 bool font_has_style(Font *font, FontStyle style);
 

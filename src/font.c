@@ -128,6 +128,21 @@ bool font_set_variation_axis(Font *font, FontStyle style,
     return font->set_variation_axis(font, font->font_data[style], axis_tag, value);
 }
 
+// Set multiple variation axis coordinates
+bool font_set_variation_axes(Font *font, FontStyle style,
+                             float *coords, int num_coords)
+{
+    if (!font || style >= FONT_STYLE_COUNT ||
+        !(font->loaded_styles & (1u << style)) || !coords || num_coords <= 0) {
+        return false;
+    }
+
+    if (!font->set_variation_axes)
+        return false;
+
+    return font->set_variation_axes(font, font->font_data[style], coords, num_coords);
+}
+
 // Check if a style is loaded
 bool font_has_style(Font *font, FontStyle style)
 {
