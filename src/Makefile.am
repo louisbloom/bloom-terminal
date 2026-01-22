@@ -4,7 +4,7 @@ bin_PROGRAMS = vterm-sdl3
 vterm_sdl3_SOURCES = main.c terminal.c renderer.c font.c font_ft.c font_resolver.c
 
 # Compiler flags - use the variables that configure.ac sets up via PKG_CHECK_MODULES
-AM_CFLAGS = $(VTERM_CFLAGS) $(SDL3_CFLAGS) $(FONTCONFIG_CFLAGS) $(FREETYPE_CFLAGS) $(CAIRO_CFLAGS) $(CAIRO_FT_CFLAGS) -Wall -Wextra
+AM_CFLAGS = $(VTERM_CFLAGS) $(SDL3_CFLAGS) $(FONTCONFIG_CFLAGS) $(FREETYPE_CFLAGS) $(HARFBUZZ_CFLAGS) -Wall -Wextra
 
 # Linker flags - include all necessary libraries
-vterm_sdl3_LDADD = $(VTERM_LIBS) $(SDL3_LIBS) $(FONTCONFIG_LIBS) $(FREETYPE_LIBS) $(CAIRO_LIBS) $(CAIRO_FT_LIBS) -lm
+vterm_sdl3_LDADD = $(VTERM_LIBS) $(SDL3_LIBS) $(FONTCONFIG_LIBS) $(FREETYPE_LIBS) $(HARFBUZZ_LIBS) -lm

@@ -8,9 +8,9 @@
 #include FT_TRUETYPE_TABLES_H
 #include "common.h"
 #include "font.h"
-#include <cairo/cairo-ft.h>
-#include <cairo/cairo.h>
 #include <fontconfig/fontconfig.h>
+#include <hb-ft.h>
+#include <hb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +19,7 @@
 typedef struct
 {
     FT_Face ft_face;          // FreeType face
+    hb_font_t *hb_font;       // HarfBuzz font wrapper
     float font_size;          // Requested font size in pixels (default 14pt)
     float scale;              // Scale factor for this font size
     unsigned char *font_data; // Raw font file data (if loaded from memory)
@@ -27,7 +28,23 @@ typedef struct
     float default_weight;     // Default weight for this font
     float min_weight;         // Minimum weight for this font
     float max_weight;         // Maximum weight for this font
-    bool has_colr;            // Whether the font has COLR table
+
+    // Variable font support
+    FT_MM_Var *mm_var; // Cached MM_Var for performance
+    int num_axes;
+    struct
+    {
+        FT_ULong tag;
+        char name[64];
+        float min_value;
+        float default_value;
+        float max_value;
+        float current_value;
+    } *axes;
+
+    bool has_colr;     // Whether the font has COLR table
+    FT_Color *palette; // COLR palette data (if any)
+    FT_UShort palette_size;
 
     // Font rendering options from Fontconfig
     bool antialias;
@@ -278,13 +295,19 @@ static void *ft_init_font(Font *font, const char *font_path,
     ft_data->scale = (float)font_size / (float)ft_data->ft_face->units_per_EM;
     vlog("Font scale factor: %f for size %.1f\n", ft_data->scale, font_size);
 
+    // Initialize HarfBuzz font from FreeType face
+    ft_data->hb_font = hb_ft_font_create_referenced(ft_data->ft_face);
+    if (!ft_data->hb_font) {
+        vlog("Warning: failed to create HarfBuzz font for %s\n", font_path);
+    }
+
     // Check for COLR table
     ft_data->has_colr = check_colr_table(ft_data->ft_face);
 
     // Apply font variations based on style
     apply_font_variations(ft_data, style);
 
-    vlog("Created FreeType/Cairo font from %s\n", font_path);
+    vlog("Created FreeType font from %s\n", font_path);
 
     return ft_data;
 }
@@ -297,6 +320,11 @@ static void ft_destroy_font(Font *font, void *font_data)
     FtFontData *ft_data = (FtFontData *)font_data;
     if (!ft_data)
         return;
+
+    if (ft_data->hb_font) {
+        hb_font_destroy(ft_data->hb_font);
+        ft_data->hb_font = NULL;
+    }
 
     if (ft_data->ft_face) {
         FT_Done_Face(ft_data->ft_face);
@@ -412,12 +440,75 @@ static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
         return NULL;
     }
 
-    // Handle COLR fonts differently (keep using Cairo for color glyphs)
+    // Handle COLR fonts differently (attempt grayscale fallback for now)
     if (ft_data->has_colr) {
-        vlog("Using Cairo for COLR glyph U+%04X\n", codepoint);
-        // Fall back to Cairo for COLR fonts since they need special handling
-        // This preserves the existing Cairo-based rendering for color fonts
-        goto cairo_fallback;
+        vlog("COLR font detected for U+%04X; using grayscale fallback (color glyphs not yet implemented)\n", codepoint);
+        // Attempt to render a grayscale fallback for COLR glyphs
+        FT_Error fallback_err = FT_Render_Glyph(face->glyph, ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO);
+        if (fallback_err) {
+            vlog("Failed to render grayscale fallback for COLR glyph U+%04X: error %d\n", codepoint, fallback_err);
+            return NULL;
+        }
+
+        FT_GlyphSlot slot2 = face->glyph;
+        FT_Bitmap *bitmap2 = &slot2->bitmap;
+
+        GlyphBitmap *glyph_bitmap_fallback = malloc(sizeof(GlyphBitmap));
+        if (!glyph_bitmap_fallback) {
+            return NULL;
+        }
+
+        glyph_bitmap_fallback->width = bitmap2->width;
+        glyph_bitmap_fallback->height = bitmap2->rows;
+        glyph_bitmap_fallback->x_offset = slot2->bitmap_left;
+        glyph_bitmap_fallback->y_offset = slot2->bitmap_top;
+        glyph_bitmap_fallback->advance = (int)(slot2->advance.x >> 6);
+
+        if (glyph_bitmap_fallback->width <= 0 || glyph_bitmap_fallback->height <= 0) {
+            glyph_bitmap_fallback->pixels = NULL;
+            return glyph_bitmap_fallback;
+        }
+
+        glyph_bitmap_fallback->pixels = malloc(glyph_bitmap_fallback->width * glyph_bitmap_fallback->height * 4);
+        if (!glyph_bitmap_fallback->pixels) {
+            free(glyph_bitmap_fallback);
+            return NULL;
+        }
+
+        if (bitmap2->pixel_mode == FT_PIXEL_MODE_GRAY) {
+            for (int y = 0; y < (int)bitmap2->rows; y++) {
+                unsigned char *src_row = bitmap2->buffer + y * bitmap2->pitch;
+                unsigned char *dst_row = glyph_bitmap_fallback->pixels + y * glyph_bitmap_fallback->width * 4;
+                for (int x = 0; x < (int)bitmap2->width; x++) {
+                    unsigned char alpha = src_row[x];
+                    dst_row[x * 4 + 0] = fg_r;
+                    dst_row[x * 4 + 1] = fg_g;
+                    dst_row[x * 4 + 2] = fg_b;
+                    dst_row[x * 4 + 3] = alpha;
+                }
+            }
+        } else if (bitmap2->pixel_mode == FT_PIXEL_MODE_MONO) {
+            for (int y = 0; y < (int)bitmap2->rows; y++) {
+                unsigned char *src_row = bitmap2->buffer + y * bitmap2->pitch;
+                unsigned char *dst_row = glyph_bitmap_fallback->pixels + y * glyph_bitmap_fallback->width * 4;
+                for (int x = 0; x < (int)bitmap2->width; x++) {
+                    unsigned char byte = src_row[x >> 3];
+                    unsigned char bit = (byte >> (7 - (x & 7))) & 1;
+                    unsigned char alpha = bit ? 255 : 0;
+                    dst_row[x * 4 + 0] = fg_r;
+                    dst_row[x * 4 + 1] = fg_g;
+                    dst_row[x * 4 + 2] = fg_b;
+                    dst_row[x * 4 + 3] = alpha;
+                }
+            }
+        } else {
+            free(glyph_bitmap_fallback->pixels);
+            free(glyph_bitmap_fallback);
+            return NULL;
+        }
+
+        vlog("Rendered grayscale fallback for COLR glyph U+%04X: %dx%d\n", codepoint, glyph_bitmap_fallback->width, glyph_bitmap_fallback->height);
+        return glyph_bitmap_fallback;
     }
 
     // Render the glyph to a bitmap
@@ -496,234 +587,74 @@ static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
          codepoint, glyph_bitmap->width, glyph_bitmap->height, glyph_bitmap->x_offset, glyph_bitmap->y_offset, glyph_bitmap->advance);
     return glyph_bitmap;
 
-cairo_fallback:
-    // Original Cairo-based rendering for COLR fonts (preserved for compatibility)
-    // Create a temporary surface to measure text extents
-    cairo_surface_t *temp_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 64, 64);
-    if (cairo_surface_status(temp_surface) != CAIRO_STATUS_SUCCESS) {
-        vlog("Failed to create temporary Cairo surface for glyph U+%04X\n", codepoint);
+    // COLR rendering not yet implemented with FreeType directly; fall back to simple grayscale rendering
+    vlog("COLR glyph rendering requested for U+%04X but COLR support is not implemented; attempting grayscale fallback\n", codepoint);
+    // Try to render a grayscale glyph as a fallback (may lose color information)
+    FT_Error colr_err = FT_Render_Glyph(face->glyph, ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO);
+    if (colr_err) {
+        vlog("Fallback grayscale render failed for U+%04X: error %d\n", codepoint, colr_err);
         return NULL;
     }
 
-    cairo_t *temp_cr = cairo_create(temp_surface);
-    if (cairo_status(temp_cr) != CAIRO_STATUS_SUCCESS) {
-        vlog("Failed to create temporary Cairo context for glyph U+%04X\n", codepoint);
-        cairo_surface_destroy(temp_surface);
+    FT_GlyphSlot slot2 = face->glyph;
+    FT_Bitmap *bitmap2 = &slot2->bitmap;
+
+    GlyphBitmap *glyph_bitmap_fallback = malloc(sizeof(GlyphBitmap));
+    if (!glyph_bitmap_fallback) {
         return NULL;
     }
 
-    // Create Cairo font face from FreeType face
-    cairo_font_face_t *cairo_face = cairo_ft_font_face_create_for_ft_face(ft_data->ft_face, 0);
-    if (cairo_font_face_status(cairo_face) != CAIRO_STATUS_SUCCESS) {
-        vlog("Failed to create Cairo font face for glyph U+%04X\n", codepoint);
-        cairo_destroy(temp_cr);
-        cairo_surface_destroy(temp_surface);
+    glyph_bitmap_fallback->width = bitmap2->width;
+    glyph_bitmap_fallback->height = bitmap2->rows;
+    glyph_bitmap_fallback->x_offset = slot2->bitmap_left;
+    glyph_bitmap_fallback->y_offset = slot2->bitmap_top;
+    glyph_bitmap_fallback->advance = (int)(slot2->advance.x >> 6);
+
+    if (glyph_bitmap_fallback->width <= 0 || glyph_bitmap_fallback->height <= 0) {
+        glyph_bitmap_fallback->pixels = NULL;
+        return glyph_bitmap_fallback;
+    }
+
+    glyph_bitmap_fallback->pixels = malloc(glyph_bitmap_fallback->width * glyph_bitmap_fallback->height * 4);
+    if (!glyph_bitmap_fallback->pixels) {
+        free(glyph_bitmap_fallback);
         return NULL;
     }
 
-    // Set the font face and size on temporary context
-    cairo_set_font_face(temp_cr, cairo_face);
-    cairo_set_font_size(temp_cr, ft_data->font_size);
-
-    // Convert codepoint to UTF-8
-    char utf8_char[5] = { 0 }; // Up to 4 bytes for UTF-8 + null terminator
-
-    if (codepoint <= 0x7F) {
-        utf8_char[0] = (char)codepoint;
-    } else if (codepoint <= 0x7FF) {
-        utf8_char[0] = 0xC0 | (codepoint >> 6);
-        utf8_char[1] = 0x80 | (codepoint & 0x3F);
-    } else if (codepoint <= 0xFFFF) {
-        utf8_char[0] = 0xE0 | (codepoint >> 12);
-        utf8_char[1] = 0x80 | ((codepoint >> 6) & 0x3F);
-        utf8_char[2] = 0x80 | (codepoint & 0x3F);
-    } else {
-        utf8_char[0] = 0xF0 | (codepoint >> 18);
-        utf8_char[1] = 0x80 | ((codepoint >> 12) & 0x3F);
-        utf8_char[2] = 0x80 | ((codepoint >> 6) & 0x3F);
-        utf8_char[3] = 0x80 | (codepoint & 0x3F);
-    }
-
-    // Get text extents for proper sizing
-    cairo_text_extents_t extents;
-    cairo_text_extents(temp_cr, utf8_char, &extents);
-
-    vlog("Glyph U+%04X text extents: width=%.2f, height=%.2f, x_bearing=%.2f, y_bearing=%.2f, x_advance=%.2f, y_advance=%.2f\n",
-         codepoint, extents.width, extents.height, extents.x_bearing, extents.y_bearing, extents.x_advance, extents.y_advance);
-
-    // Determine surface size based on text extents with padding
-    int padding = 2; // Use minimal padding
-    int surface_width = (int)(extents.width + padding * 2 + 0.5);
-    int surface_height = (int)(extents.height + padding * 2 + 0.5);
-
-    // Ensure minimum size
-    surface_width = surface_width > 0 ? surface_width : 32;
-    surface_height = surface_height > 0 ? surface_height : 32;
-
-    vlog("Glyph U+%04X surface size: %dx%d\n", codepoint, surface_width, surface_height);
-
-    // Clean up temporary context
-    cairo_destroy(temp_cr);
-    cairo_surface_destroy(temp_surface);
-
-    // Create actual surface and context
-    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, surface_width, surface_height);
-    if (cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
-        vlog("Failed to create Cairo surface for glyph U+%04X\n", codepoint);
-        cairo_font_face_destroy(cairo_face);
-        return NULL;
-    }
-
-    cairo_t *cr = cairo_create(surface);
-    if (cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
-        vlog("Failed to create Cairo context for glyph U+%04X\n", codepoint);
-        cairo_surface_destroy(surface);
-        cairo_font_face_destroy(cairo_face);
-        return NULL;
-    }
-
-    // Clear the surface to transparent
-    cairo_save(cr);
-    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
-    cairo_paint(cr);
-    cairo_restore(cr);
-
-    // Set the font face and size
-    cairo_set_font_face(cr, cairo_face);
-    cairo_set_font_size(cr, ft_data->font_size);
-
-    // Create and configure font options based on Fontconfig settings
-    cairo_font_options_t *font_options = cairo_font_options_create();
-
-    // Map Fontconfig antialias setting to Cairo
-    if (ft_data->antialias) {
-        cairo_font_options_set_antialias(font_options, CAIRO_ANTIALIAS_SUBPIXEL);
-    } else {
-        cairo_font_options_set_antialias(font_options, CAIRO_ANTIALIAS_NONE);
-    }
-
-    // Map Fontconfig hint style to Cairo
-    switch (ft_data->hint_style) {
-    case FC_HINT_NONE:
-        cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_NONE);
-        break;
-    case FC_HINT_SLIGHT:
-        cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_SLIGHT);
-        break;
-    case FC_HINT_MEDIUM:
-        cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_MEDIUM);
-        break;
-    case FC_HINT_FULL:
-        cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_FULL);
-        break;
-    default:
-        cairo_font_options_set_hint_style(font_options, CAIRO_HINT_STYLE_SLIGHT);
-        break;
-    }
-
-    // Always enable hint metrics for better consistency
-    cairo_font_options_set_hint_metrics(font_options, CAIRO_HINT_METRICS_ON);
-
-    // Set subpixel order for better text rendering (as per design document)
-    cairo_font_options_set_subpixel_order(font_options, CAIRO_SUBPIXEL_ORDER_RGB);
-
-    // Apply font options
-    cairo_set_font_options(cr, font_options);
-
-    // Get font-wide metrics for proper baseline alignment
-    cairo_font_extents_t font_extents;
-    cairo_font_extents(cr, &font_extents);
-
-    // Position for rendering
-    // For x-positioning, we use the glyph's own bearing for proper horizontal alignment
-    double render_x = padding - extents.x_bearing;
-    // For y-positioning, we use the glyph's own bearing for proper vertical alignment
-    double render_y = padding - extents.y_bearing;
-
-    // Render directly as color glyphs
-    vlog("Rendering COLR glyph U+%04X directly with Cairo\n", codepoint);
-    cairo_move_to(cr, render_x, render_y);
-    cairo_show_text(cr, utf8_char);
-
-    // Check for Cairo errors
-    if (cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
-        vlog("Cairo error when rendering glyph U+%04X: %s\n", codepoint, cairo_status_to_string(cairo_status(cr)));
-        cairo_font_face_destroy(cairo_face);
-        cairo_destroy(cr);
-        cairo_surface_destroy(surface);
-        return NULL;
-    }
-
-    // Get the actual surface dimensions and data
-    cairo_surface_flush(surface);
-    unsigned char *cairo_pixels = cairo_image_surface_get_data(surface);
-    int cairo_width = cairo_image_surface_get_width(surface);
-    int cairo_height = cairo_image_surface_get_height(surface);
-    int cairo_stride = cairo_image_surface_get_stride(surface);
-
-    // Allocate glyph bitmap
-    GlyphBitmap *glyph_bitmap_cairo = malloc(sizeof(GlyphBitmap));
-    if (!glyph_bitmap_cairo) {
-        cairo_font_face_destroy(cairo_face);
-        cairo_destroy(cr);
-        cairo_surface_destroy(surface);
-        return NULL;
-    }
-
-    glyph_bitmap_cairo->width = cairo_width;
-    glyph_bitmap_cairo->height = cairo_height;
-    glyph_bitmap_cairo->x_offset = (int)(render_x + extents.x_bearing); // Position relative to cell
-    // For y_offset, we need to calculate the distance from the top of the bitmap to the baseline
-    // render_y is the position where we draw the glyph, and extents.y_bearing tells us where the baseline is relative to that
-    glyph_bitmap_cairo->y_offset = (int)(padding - extents.y_bearing); // Position relative to baseline
-    glyph_bitmap_cairo->advance = (int)(extents.x_advance + 0.5);      // Round to nearest integer
-
-    // Handle zero-width or zero-height glyphs (e.g., spaces)
-    if (glyph_bitmap_cairo->width <= 0 || glyph_bitmap_cairo->height <= 0) {
-        vlog("Glyph has zero dimensions: %dx%d, creating empty bitmap\n", glyph_bitmap_cairo->width, glyph_bitmap_cairo->height);
-        glyph_bitmap_cairo->pixels = NULL; // No pixels for empty glyphs
-        cairo_font_face_destroy(cairo_face);
-        cairo_destroy(cr);
-        cairo_surface_destroy(surface);
-        return glyph_bitmap_cairo;
-    }
-
-    // Allocate RGBA pixels
-    glyph_bitmap_cairo->pixels = malloc(glyph_bitmap_cairo->width * glyph_bitmap_cairo->height * 4);
-    if (!glyph_bitmap_cairo->pixels) {
-        free(glyph_bitmap_cairo);
-        cairo_font_face_destroy(cairo_face);
-        cairo_destroy(cr);
-        cairo_surface_destroy(surface);
-        return NULL;
-    }
-
-    // Copy and convert the pixel data (Cairo uses BGRA, we need RGBA)
-    for (int y = 0; y < cairo_height; y++) {
-        unsigned char *src_row = cairo_pixels + y * cairo_stride;
-        unsigned char *dst_row = glyph_bitmap_cairo->pixels + y * cairo_width * 4;
-        for (int x = 0; x < cairo_width; x++) {
-            unsigned char b = src_row[x * 4 + 0];
-            unsigned char g = src_row[x * 4 + 1];
-            unsigned char r = src_row[x * 4 + 2];
-            unsigned char a = src_row[x * 4 + 3];
-
-            dst_row[x * 4 + 0] = r; // R
-            dst_row[x * 4 + 1] = g; // G
-            dst_row[x * 4 + 2] = b; // B
-            dst_row[x * 4 + 3] = a; // A
+    if (bitmap2->pixel_mode == FT_PIXEL_MODE_GRAY) {
+        for (int y = 0; y < (int)bitmap2->rows; y++) {
+            unsigned char *src_row = bitmap2->buffer + y * bitmap2->pitch;
+            unsigned char *dst_row = glyph_bitmap_fallback->pixels + y * glyph_bitmap_fallback->width * 4;
+            for (int x = 0; x < (int)bitmap2->width; x++) {
+                unsigned char alpha = src_row[x];
+                dst_row[x * 4 + 0] = fg_r;
+                dst_row[x * 4 + 1] = fg_g;
+                dst_row[x * 4 + 2] = fg_b;
+                dst_row[x * 4 + 3] = alpha;
+            }
         }
+    } else if (bitmap2->pixel_mode == FT_PIXEL_MODE_MONO) {
+        for (int y = 0; y < (int)bitmap2->rows; y++) {
+            unsigned char *src_row = bitmap2->buffer + y * bitmap2->pitch;
+            unsigned char *dst_row = glyph_bitmap_fallback->pixels + y * glyph_bitmap_fallback->width * 4;
+            for (int x = 0; x < (int)bitmap2->width; x++) {
+                unsigned char byte = src_row[x >> 3];
+                unsigned char bit = (byte >> (7 - (x & 7))) & 1;
+                unsigned char alpha = bit ? 255 : 0;
+                dst_row[x * 4 + 0] = fg_r;
+                dst_row[x * 4 + 1] = fg_g;
+                dst_row[x * 4 + 2] = fg_b;
+                dst_row[x * 4 + 3] = alpha;
+            }
+        }
+    } else {
+        free(glyph_bitmap_fallback->pixels);
+        free(glyph_bitmap_fallback);
+        return NULL;
     }
 
-    // Clean up
-    cairo_font_options_destroy(font_options);
-    cairo_font_face_destroy(cairo_face);
-    cairo_destroy(cr);
-    cairo_surface_destroy(surface);
-
-    vlog("Successfully rendered COLR glyph U+%04X with Cairo: %dx%d pixels, x_offset=%d, y_offset=%d, advance=%d\n",
-         codepoint, glyph_bitmap_cairo->width, glyph_bitmap_cairo->height, glyph_bitmap_cairo->x_offset, glyph_bitmap_cairo->y_offset, glyph_bitmap_cairo->advance);
-    return glyph_bitmap_cairo;
+    vlog("Rendered grayscale fallback for COLR glyph U+%04X: %dx%d\n", codepoint, glyph_bitmap_fallback->width, glyph_bitmap_fallback->height);
+    return glyph_bitmap_fallback;
 }
 
 // Get glyph info without rendering
@@ -761,7 +692,7 @@ static bool ft_get_glyph_info(Font *font, void *font_data, uint32_t codepoint,
 
 // FreeType/Cairo font implementation
 Font font = {
-    .name = "freetype/cairo",
+    .name = "freetype",
     .init = font_init,
     .destroy = font_destroy,
     .init_font = ft_init_font,

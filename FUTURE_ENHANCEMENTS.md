@@ -11,11 +11,13 @@ This document outlines potential future enhancements for the vterm-sdl3 terminal
 **Performance Gain:** Moderate-to-High (10-30% for large glyph counts)
 
 ### Current State
+
 - Using SDL_Renderer with SDL_Texture for glyph rendering
 - Each glyph uploaded as separate texture
 - Simple, well-tested, portable approach
 
 ### Enhancement Goals
+
 - Migrate to SDL3 GPU API for lower-level control
 - Reduce CPU-GPU synchronization overhead
 - Enable advanced techniques (texture atlas, instanced rendering)
@@ -33,30 +35,31 @@ typedef struct GlyphAtlas {
     int cell_height;
     int glyphs_per_row;            // e.g., 2048/16 = 128
     int glyphs_per_col;
-    
+
     struct {
         uint32_t codepoint;
         bool occupied;
         float u0, v0, u1, v1;      // UV coordinates in atlas
     } *cells;                       // Array of cell metadata
-    
+
     int next_free_cell;            // LRU eviction pointer
 } GlyphAtlas;
 ```
 
 **Atlas Packing Algorithm:**
+
 ```c
 bool atlas_add_glyph(GlyphAtlas *atlas, uint32_t codepoint, GlyphBitmap *bitmap) {
     // Find free cell (or evict least recently used)
     int cell_index = atlas_find_or_evict_cell(atlas);
-    
+
     int row = cell_index / atlas->glyphs_per_row;
     int col = cell_index % atlas->glyphs_per_row;
-    
+
     // Calculate pixel offset in atlas
     int x_offset = col * atlas->cell_width;
     int y_offset = row * atlas->cell_height;
-    
+
     // Upload glyph bitmap to atlas region
     SDL_GPUTextureRegion region = {
         .texture = atlas->texture,
@@ -67,11 +70,11 @@ bool atlas_add_glyph(GlyphAtlas *atlas, uint32_t codepoint, GlyphBitmap *bitmap)
         .start_layer = 0,
         .num_layers = 1
     };
-    
+
     // Upload via transfer buffer
     SDL_GPUTransferBuffer *transfer = create_transfer_buffer(device, bitmap);
     SDL_UploadToGPUTexture(cmd_buffer, &transfer_source, &region, false);
-    
+
     // Store UV coordinates
     atlas->cells[cell_index].u0 = (float)x_offset / 2048.0f;
     atlas->cells[cell_index].v0 = (float)y_offset / 2048.0f;
@@ -79,7 +82,7 @@ bool atlas_add_glyph(GlyphAtlas *atlas, uint32_t codepoint, GlyphBitmap *bitmap)
     atlas->cells[cell_index].v1 = (float)(y_offset + bitmap->height) / 2048.0f;
     atlas->cells[cell_index].codepoint = codepoint;
     atlas->cells[cell_index].occupied = true;
-    
+
     return true;
 }
 ```
@@ -102,10 +105,10 @@ void build_glyph_instances(Terminal *term, GlyphInstance *instances, int *count)
     for (int row = 0; row < term->rows; row++) {
         for (int col = 0; col < term->cols; col++) {
             TermCell *cell = get_cell(term, row, col);
-            
+
             // Lookup glyph in atlas
             AtlasCell *atlas_cell = atlas_lookup(atlas, cell->codepoint);
-            
+
             instances[idx].x = col * cell_width;
             instances[idx].y = row * cell_height;
             instances[idx].u0 = atlas_cell->u0;
@@ -118,7 +121,7 @@ void build_glyph_instances(Terminal *term, GlyphInstance *instances, int *count)
             instances[idx].g = cell->fg_g;
             instances[idx].b = cell->fg_b;
             instances[idx].a = 255;
-            
+
             idx++;
         }
     }
@@ -129,10 +132,10 @@ void build_glyph_instances(Terminal *term, GlyphInstance *instances, int *count)
 void render_terminal_gpu(SDL_GPUDevice *device, GlyphInstance *instances, int count) {
     // Upload instance data to GPU buffer
     SDL_GPUBuffer *instance_buffer = upload_instances(device, instances, count);
-    
+
     // Bind atlas texture
     SDL_BindGPUFragmentSamplers(render_pass, 0, &atlas_binding, 1);
-    
+
     // Draw instanced (one call for entire screen!)
     SDL_DrawGPUPrimitivesInstanced(render_pass, 6, count, 0, 0);
 }
@@ -141,6 +144,7 @@ void render_terminal_gpu(SDL_GPUDevice *device, GlyphInstance *instances, int co
 #### 1.3 Graphics Pipeline Setup
 
 **Vertex Shader:**
+
 ```glsl
 #version 450
 
@@ -164,7 +168,7 @@ void main() {
     // Calculate screen position
     vec2 screen_pos = instance_pos + in_pos * instance_size;
     gl_Position = pc.projection * vec4(screen_pos, 0.0, 1.0);
-    
+
     // Calculate atlas UV
     frag_uv = mix(instance_uv.xy, instance_uv.zw, in_uv);
     frag_color = instance_color;
@@ -172,6 +176,7 @@ void main() {
 ```
 
 **Fragment Shader:**
+
 ```glsl
 #version 450
 
@@ -211,6 +216,7 @@ void main() {
    - A/B test vs current implementation
 
 ### Expected Performance
+
 - **Current:** ~10,000 draw calls for 80x24 terminal = ~240ms/frame @ 60fps budget
 - **GPU API:** 1 draw call = ~2-5ms/frame
 - **Overall:** 10-30% performance improvement + lower CPU usage
@@ -224,12 +230,14 @@ void main() {
 **User Benefit:** Enhanced typography and accessibility
 
 ### Current State
+
 - Support for Weight (wght) axis: 100-900
 - Support for Width (wdth) axis: 50-200
 
 ### Additional Axes to Support
 
 #### 2.1 Slant Axis (slnt)
+
 **Range:** -15° to 0°  
 **Use Case:** Oblique/italic text without separate font file
 
@@ -244,6 +252,7 @@ void set_italic_via_slant(FtFontData *ft_data, bool italic) {
 **Terminal Use:** Italic escape sequence (`\033[3m`) could use slant instead of loading separate font.
 
 #### 2.2 Italic Axis (ital)
+
 **Range:** 0.0 (Roman) to 1.0 (Italic)  
 **Use Case:** True italic with alternate letterforms
 
@@ -258,6 +267,7 @@ void set_true_italic(FtFontData *ft_data, bool italic) {
 **Difference from Slant:** Italic axis provides true cursive forms (different 'a', 'g', etc.), while slant just skews glyphs.
 
 #### 2.3 Optical Size (opsz)
+
 **Range:** 6pt to 144pt  
 **Use Case:** Optimize rendering for different font sizes
 
@@ -271,6 +281,7 @@ void set_optical_size(FtFontData *ft_data, float font_size_pt) {
 **Terminal Use:** Small terminals (10pt) get more open spacing, large terminals (20pt) get finer details.
 
 #### 2.4 Grade (GRAD)
+
 **Range:** -200 to 200  
 **Use Case:** Adjust weight without changing metrics (for accessibility)
 
@@ -284,6 +295,7 @@ void adjust_for_readability(FtFontData *ft_data, int grade) {
 **Terminal Use:** User preference for "high contrast mode" without changing cell sizes.
 
 #### 2.5 Custom Axes
+
 Support for font-specific axes (e.g., "ROND" for roundness, "SOFT" for softness).
 
 ```c
@@ -292,19 +304,19 @@ bool ft_set_custom_axis(FtFontData *ft_data, uint32_t tag, float value) {
     // Find axis in ft_data->axes array
     for (int i = 0; i < ft_data->num_axes; i++) {
         if (ft_data->axes[i].tag == tag) {
-            if (value < ft_data->axes[i].min_value || 
+            if (value < ft_data->axes[i].min_value ||
                 value > ft_data->axes[i].max_value) {
                 return false;  // Out of range
             }
-            
+
             ft_data->axes[i].current_value = value;
-            
+
             // Rebuild coordinate array and apply
             FT_Fixed *coords = build_coordinate_array(ft_data);
             FT_Set_Var_Design_Coordinates(ft_data->ft_face, ft_data->num_axes, coords);
             hb_ft_font_changed(ft_data->hb_font);
             free(coords);
-            
+
             return true;
         }
     }
@@ -315,6 +327,7 @@ bool ft_set_custom_axis(FtFontData *ft_data, uint32_t tag, float value) {
 ### Configuration Interface
 
 **User Config File (e.g., `~/.config/vterm-sdl3/fontrc`):**
+
 ```ini
 [font.axes]
 # Standard axes
@@ -335,6 +348,7 @@ italic.slant = -12
 ```
 
 ### Implementation Effort
+
 - **API:** Already designed in main proposal
 - **Config Parsing:** ~2 days
 - **UI/Testing:** ~3 days
@@ -349,10 +363,12 @@ italic.slant = -12
 **User Benefit:** Proper Arabic, Hebrew, Persian rendering
 
 ### Current State
+
 - LTR (left-to-right) only
 - No Unicode BiDi algorithm
 
 ### Enhancement Goals
+
 - Full Unicode BiDi Algorithm (UAX #9)
 - Mixed LTR/RTL text on same line
 - Proper cursor movement in RTL text
@@ -362,6 +378,7 @@ italic.slant = -12
 #### 3.1 BiDi Resolution with HarfBuzz
 
 **HarfBuzz Direction Support:**
+
 ```c
 typedef enum {
     HB_DIRECTION_LTR,   // Left-to-right (English, etc.)
@@ -372,6 +389,7 @@ typedef enum {
 ```
 
 **BiDi Analysis:**
+
 ```c
 #include <fribidi.h>  // GNU FriBidi library for BiDi algorithm
 
@@ -386,21 +404,21 @@ BiDiRun *analyze_bidi(uint32_t *codepoints, int count, int *num_runs) {
     // Allocate FriBidi types array
     FriBidiCharType *types = malloc(count * sizeof(FriBidiCharType));
     FriBidiLevel *levels = malloc(count * sizeof(FriBidiLevel));
-    
+
     // Get character types (L, R, AL, EN, etc.)
     fribidi_get_bidi_types(codepoints, count, types);
-    
+
     // Resolve BiDi levels
     FriBidiLevel base_level = FRIBIDI_TYPE_LTR;  // Or RTL for RTL paragraphs
     fribidi_get_par_embedding_levels(types, count, &base_level, levels);
-    
+
     // Split into runs of consistent direction
     BiDiRun *runs = malloc(count * sizeof(BiDiRun));  // Max possible runs
     int run_count = 0;
-    
+
     int run_start = 0;
     FriBidiLevel current_level = levels[0];
-    
+
     for (int i = 1; i <= count; i++) {
         if (i == count || levels[i] != current_level) {
             // End of run
@@ -409,17 +427,17 @@ BiDiRun *analyze_bidi(uint32_t *codepoints, int count, int *num_runs) {
             runs[run_count].level = current_level;
             runs[run_count].dir = (current_level % 2) ? HB_DIRECTION_RTL : HB_DIRECTION_LTR;
             run_count++;
-            
+
             if (i < count) {
                 run_start = i;
                 current_level = levels[i];
             }
         }
     }
-    
+
     free(types);
     free(levels);
-    
+
     *num_runs = run_count;
     return runs;
 }
@@ -428,17 +446,18 @@ BiDiRun *analyze_bidi(uint32_t *codepoints, int count, int *num_runs) {
 #### 3.2 Rendering BiDi Text
 
 **Shape Each Run Separately:**
+
 ```c
 void render_bidi_line(Renderer *rend, uint32_t *codepoints, int count,
                       int x, int y, uint8_t r, uint8_t g, uint8_t b) {
     // Analyze BiDi structure
     int num_runs;
     BiDiRun *runs = analyze_bidi(codepoints, count, &num_runs);
-    
+
     // Process runs in visual order (may be different from logical order)
     for (int i = 0; i < num_runs; i++) {
         BiDiRun *run = &runs[i];
-        
+
         // Shape this run with its direction
         ShapedGlyphRun *shaped = shape_text(
             ft_data,
@@ -446,16 +465,16 @@ void render_bidi_line(Renderer *rend, uint32_t *codepoints, int count,
             run->length,
             run->dir  // HB_DIRECTION_RTL or HB_DIRECTION_LTR
         );
-        
+
         // Render shaped run
         renderer_draw_shaped_text(rend, shaped, ft_data, x, y, r, g, b);
-        
+
         // Advance x position by total run width
         x += shaped->total_advance;
-        
+
         free_shaped_run(shaped);
     }
-    
+
     free(runs);
 }
 ```
@@ -463,6 +482,7 @@ void render_bidi_line(Renderer *rend, uint32_t *codepoints, int count,
 #### 3.3 Cursor Movement in BiDi
 
 **Logical vs Visual Movement:**
+
 ```c
 // Move cursor logically (in text buffer order)
 int cursor_move_logical(BiDiContext *ctx, int current_pos, int delta) {
@@ -479,7 +499,7 @@ int cursor_move_visual(BiDiContext *ctx, int current_pos, int direction) {
     int *visual_to_logical = malloc(ctx->length * sizeof(int));
     fribidi_reorder_line(ctx->levels, ctx->length, 0, ctx->base_dir,
                          NULL, NULL, NULL, visual_to_logical);
-    
+
     // Find current visual position
     int visual_pos = -1;
     for (int i = 0; i < ctx->length; i++) {
@@ -488,28 +508,30 @@ int cursor_move_visual(BiDiContext *ctx, int current_pos, int direction) {
             break;
         }
     }
-    
+
     // Move visually
     int new_visual_pos = visual_pos + direction;
     if (new_visual_pos < 0 || new_visual_pos >= ctx->length) {
         free(visual_to_logical);
         return current_pos;
     }
-    
+
     // Convert back to logical
     int new_logical_pos = visual_to_logical[new_visual_pos];
     free(visual_to_logical);
-    
+
     return new_logical_pos;
 }
 ```
 
 ### External Dependencies
+
 - **GNU FriBidi:** BiDi algorithm implementation
 - **HarfBuzz:** Already supports RTL shaping
 - **FreeType:** No changes needed
 
 ### Implementation Plan
+
 1. Add FriBidi dependency to build system
 2. Implement BiDi analysis function
 3. Modify renderer to handle multiple runs per line
@@ -517,6 +539,7 @@ int cursor_move_visual(BiDiContext *ctx, int current_pos, int direction) {
 5. Test with Arabic/Hebrew test files
 
 ### Estimated Effort
+
 - **Core BiDi:** 1-2 weeks
 - **Cursor Logic:** 1 week
 - **Testing:** 1 week
@@ -531,10 +554,12 @@ int cursor_move_visual(BiDiContext *ctx, int current_pos, int direction) {
 **Performance Gain:** High (50-80% for repeated glyphs)
 
 ### Current State
+
 - No caching: every glyph rendered on-demand
 - GPU textures created/destroyed per frame
 
 ### Enhancement Goals
+
 - LRU (Least Recently Used) cache for rendered glyphs
 - Cache shaped runs (e.g., "fi" ligature)
 - Texture reuse to reduce GPU allocations
@@ -550,12 +575,12 @@ typedef struct CachedGlyph {
     uint32_t codepoint;
     FontStyle style;
     uint8_t r, g, b;           // Foreground color
-    
+
     SDL_Texture *texture;      // Rendered texture
     int width, height;
     int x_offset, y_offset;
     int advance;
-    
+
     uint64_t last_used;        // Timestamp for LRU
     bool occupied;
 } CachedGlyph;
@@ -565,7 +590,7 @@ typedef struct GlyphCache {
     int capacity;
     int count;
     uint64_t frame_counter;    // Increment each frame for LRU
-    
+
     // Hash table for O(1) lookup
     int *hash_table;           // Maps hash -> cache index
     int hash_table_size;
@@ -586,19 +611,19 @@ CachedGlyph *cache_lookup(GlyphCache *cache, uint32_t codepoint, FontStyle style
                           uint8_t r, uint8_t g, uint8_t b) {
     uint32_t hash = hash_glyph(codepoint, style, r, g, b);
     int idx = cache->hash_table[hash % cache->hash_table_size];
-    
+
     if (idx >= 0 && cache->entries[idx].occupied) {
         CachedGlyph *glyph = &cache->entries[idx];
-        if (glyph->codepoint == codepoint && 
+        if (glyph->codepoint == codepoint &&
             glyph->style == style &&
             glyph->r == r && glyph->g == g && glyph->b == b) {
-            
+
             // Update LRU timestamp
             glyph->last_used = cache->frame_counter;
             return glyph;
         }
     }
-    
+
     return NULL;  // Cache miss
 }
 
@@ -608,7 +633,7 @@ void cache_insert(GlyphCache *cache, uint32_t codepoint, FontStyle style,
                   int width, int height, int x_offset, int y_offset, int advance) {
     uint32_t hash = hash_glyph(codepoint, style, r, g, b);
     int slot;
-    
+
     if (cache->count < cache->capacity) {
         // Find empty slot
         slot = cache->count++;
@@ -622,11 +647,11 @@ void cache_insert(GlyphCache *cache, uint32_t codepoint, FontStyle style,
                 slot = i;
             }
         }
-        
+
         // Free old texture
         SDL_DestroyTexture(cache->entries[slot].texture);
     }
-    
+
     // Insert new entry
     CachedGlyph *entry = &cache->entries[slot];
     entry->codepoint = codepoint;
@@ -642,7 +667,7 @@ void cache_insert(GlyphCache *cache, uint32_t codepoint, FontStyle style,
     entry->advance = advance;
     entry->last_used = cache->frame_counter;
     entry->occupied = true;
-    
+
     // Update hash table
     cache->hash_table[hash % cache->hash_table_size] = slot;
 }
@@ -651,12 +676,13 @@ void cache_insert(GlyphCache *cache, uint32_t codepoint, FontStyle style,
 #### 4.2 Shaped Run Cache
 
 **For ligatures and complex sequences:**
+
 ```c
 typedef struct CachedShapedRun {
     uint32_t *codepoints;      // Key: sequence of codepoints
     int codepoint_count;
     FontStyle style;
-    
+
     ShapedGlyphRun *shaped;    // Cached shaped result
     uint64_t last_used;
     bool occupied;
@@ -670,15 +696,15 @@ typedef struct ShapedRunCache {
 } ShapedRunCache;
 
 // Lookup shaped run
-ShapedGlyphRun *shaped_cache_lookup(ShapedRunCache *cache, 
+ShapedGlyphRun *shaped_cache_lookup(ShapedRunCache *cache,
                                      uint32_t *codepoints, int count,
                                      FontStyle style) {
     for (int i = 0; i < SHAPED_CACHE_SIZE; i++) {
         CachedShapedRun *entry = &cache->entries[i];
-        
-        if (entry->occupied && entry->codepoint_count == count && 
+
+        if (entry->occupied && entry->codepoint_count == count &&
             entry->style == style) {
-            
+
             // Compare codepoint sequences
             bool match = true;
             for (int j = 0; j < count; j++) {
@@ -687,14 +713,14 @@ ShapedGlyphRun *shaped_cache_lookup(ShapedRunCache *cache,
                     break;
                 }
             }
-            
+
             if (match) {
                 entry->last_used = cache->frame_counter;
                 return entry->shaped;
             }
         }
     }
-    
+
     return NULL;  // Cache miss
 }
 ```
@@ -707,16 +733,16 @@ typedef struct CacheStats {
     uint64_t hits;
     uint64_t misses;
     uint64_t evictions;
-    
+
     double hit_rate;
 } CacheStats;
 
 void cache_print_stats(GlyphCache *cache, CacheStats *stats) {
     stats->hit_rate = (double)stats->hits / (double)stats->lookups;
-    
+
     printf("Glyph Cache Statistics:\n");
     printf("  Capacity: %d\n", cache->capacity);
-    printf("  Occupied: %d (%.1f%%)\n", cache->count, 
+    printf("  Occupied: %d (%.1f%%)\n", cache->count,
            100.0 * cache->count / cache->capacity);
     printf("  Lookups: %lu\n", stats->lookups);
     printf("  Hits: %lu (%.2f%%)\n", stats->hits, 100.0 * stats->hit_rate);
@@ -742,6 +768,7 @@ void cache_print_stats(GlyphCache *cache, CacheStats *stats) {
    - Cache grayscale, colorize on GPU: Fewer entries but shader complexity
 
 ### Implementation Plan
+
 1. Implement basic LRU cache (1 day)
 2. Add hash table for O(1) lookup (1 day)
 3. Integrate with renderer (1 day)
@@ -750,6 +777,7 @@ void cache_print_stats(GlyphCache *cache, CacheStats *stats) {
 6. **Total:** ~1 week
 
 ### Expected Performance
+
 - **ASCII-heavy terminals:** 80-90% hit rate (26 lowercase + 26 uppercase + digits + symbols)
 - **Unicode terminals:** 60-70% hit rate (more unique glyphs)
 - **Ligature-heavy code:** 50-60% hit rate (many unique sequences)
@@ -763,10 +791,12 @@ void cache_print_stats(GlyphCache *cache, CacheStats *stats) {
 **User Benefit:** Sharper text on LCD screens
 
 ### Current State
+
 - Basic grayscale anti-aliasing
 - No subpixel rendering
 
 ### Enhancement Goals
+
 - RGB subpixel rendering for LCD screens
 - FreeType LCD filtering support
 - Configuration for RGB vs BGR subpixel order
@@ -781,7 +811,7 @@ void enable_lcd_rendering(FtFontData *ft_data, int subpixel_order) {
     // Set LCD filter (reduces color fringing)
     FT_Library_SetLcdFilter(ft_library, FT_LCD_FILTER_DEFAULT);
     // Or: FT_LCD_FILTER_LIGHT, FT_LCD_FILTER_LEGACY
-    
+
     // Update load flags
     switch (subpixel_order) {
         case FC_RGBA_RGB:
@@ -802,32 +832,32 @@ GlyphBitmap *render_lcd_glyph(FtFontData *ft_data, FT_UInt glyph_index,
                                uint8_t fg_r, uint8_t fg_g, uint8_t fg_b) {
     FT_Load_Glyph(ft_data->ft_face, glyph_index, ft_data->ft_load_flags);
     FT_Render_Glyph(ft_data->ft_face->glyph, FT_RENDER_MODE_LCD);
-    
+
     FT_Bitmap *bitmap = &ft_data->ft_face->glyph->bitmap;
     // bitmap->pixel_mode == FT_PIXEL_MODE_LCD (3 bytes per pixel: R, G, B)
-    
+
     GlyphBitmap *result = malloc(sizeof(GlyphBitmap));
     result->width = bitmap->width / 3;  // LCD mode is 3x wider
     result->height = bitmap->rows;
     result->pixels = malloc(result->width * result->height * 4);
-    
+
     // Convert LCD bitmap to RGBA
     for (int y = 0; y < result->height; y++) {
         uint8_t *src_row = bitmap->buffer + y * bitmap->pitch;
         uint8_t *dst_row = result->pixels + y * result->width * 4;
-        
+
         for (int x = 0; x < result->width; x++) {
             uint8_t r_coverage = src_row[x * 3 + 0];
             uint8_t g_coverage = src_row[x * 3 + 1];
             uint8_t b_coverage = src_row[x * 3 + 2];
-            
+
             dst_row[x * 4 + 0] = (fg_r * r_coverage) / 255;
             dst_row[x * 4 + 1] = (fg_g * g_coverage) / 255;
             dst_row[x * 4 + 2] = (fg_b * b_coverage) / 255;
             dst_row[x * 4 + 3] = (r_coverage + g_coverage + b_coverage) / 3;
         }
     }
-    
+
     return result;
 }
 ```
@@ -860,11 +890,13 @@ SubpixelOrder detect_subpixel_order(FcPattern *pattern) {
 ```
 
 ### Challenges
+
 - Subpixel rendering assumes static pixel grid (doesn't work well with scaling/rotation)
 - Color fringing on non-neutral backgrounds
 - Not ideal for OLED/PenTile displays
 
 ### Recommendation
+
 - Make optional (disabled by default)
 - Expose as config option: `subpixel_rendering = auto|rgb|bgr|vrgb|vbgr|none`
 - Provide toggle for users to test
@@ -878,10 +910,12 @@ SubpixelOrder detect_subpixel_order(FcPattern *pattern) {
 **User Benefit:** Better Unicode coverage
 
 ### Current State
+
 - Single font per style (normal, bold, emoji)
 - Missing glyphs render as □ (tofu)
 
 ### Enhancement Goals
+
 - Multiple fallback fonts
 - Automatic fallback selection per codepoint
 - Coverage cache to avoid repeated lookups
@@ -894,7 +928,7 @@ SubpixelOrder detect_subpixel_order(FcPattern *pattern) {
 typedef struct FontFallbackChain {
     FtFontData *fonts[MAX_FALLBACK_FONTS];
     int count;
-    
+
     // Coverage cache: maps codepoint -> font index
     struct {
         uint32_t codepoint;
@@ -907,7 +941,7 @@ typedef struct FontFallbackChain {
 int find_font_for_codepoint(FontFallbackChain *chain, uint32_t codepoint) {
     // Check cache first
     // ... cache lookup code ...
-    
+
     // Check each font
     for (int i = 0; i < chain->count; i++) {
         FT_UInt glyph_index = FT_Get_Char_Index(chain->fonts[i]->ft_face, codepoint);
@@ -917,7 +951,7 @@ int find_font_for_codepoint(FontFallbackChain *chain, uint32_t codepoint) {
             return i;
         }
     }
-    
+
     return -1;  // No font has this glyph
 }
 
@@ -926,17 +960,18 @@ GlyphBitmap *render_with_fallback(FontFallbackChain *chain, uint32_t codepoint,
                                    uint8_t r, uint8_t g, uint8_t b) {
     int font_idx = find_font_for_codepoint(chain, codepoint);
     if (font_idx >= 0) {
-        return rasterize_glyph(chain->fonts[font_idx], 
+        return rasterize_glyph(chain->fonts[font_idx],
                                FT_Get_Char_Index(chain->fonts[font_idx]->ft_face, codepoint),
                                r, g, b);
     }
-    
+
     // Render missing glyph symbol
     return render_missing_glyph(r, g, b);
 }
 ```
 
 **Default Fallback Chain Example:**
+
 ```
 1. JetBrains Mono (primary, good ASCII/Latin coverage)
 2. DejaVu Sans Mono (extended Latin, Greek, Cyrillic)
@@ -950,16 +985,17 @@ GlyphBitmap *render_with_fallback(FontFallbackChain *chain, uint32_t codepoint,
 
 ## Summary Table
 
-| Enhancement | Priority | Complexity | Effort | Performance Gain |
-|-------------|----------|------------|--------|------------------|
-| SDL3 GPU API | Medium | High | 3-4 weeks | 10-30% rendering |
-| Variable Font Axes | Low | Medium | 1 week | None (UX improvement) |
-| BiDi Support | Low | High | 3-4 weeks | None (RTL languages) |
-| Glyph Caching | Medium | Medium | 1 week | 50-80% rendering |
-| Subpixel Rendering | Low | Medium | 1 week | None (visual quality) |
-| Font Fallback | Medium | Medium | 1-2 weeks | None (Unicode coverage) |
+| Enhancement        | Priority | Complexity | Effort    | Performance Gain        |
+| ------------------ | -------- | ---------- | --------- | ----------------------- |
+| SDL3 GPU API       | Medium   | High       | 3-4 weeks | 10-30% rendering        |
+| Variable Font Axes | Low      | Medium     | 1 week    | None (UX improvement)   |
+| BiDi Support       | Low      | High       | 3-4 weeks | None (RTL languages)    |
+| Glyph Caching      | Medium   | Medium     | 1 week    | 50-80% rendering        |
+| Subpixel Rendering | Low      | Medium     | 1 week    | None (visual quality)   |
+| Font Fallback      | Medium   | Medium     | 1-2 weeks | None (Unicode coverage) |
 
 **Recommended Order:**
+
 1. **Glyph Caching** - Highest ROI (quick win)
 2. **Font Fallback** - Better Unicode support
 3. **SDL3 GPU API** - Performance for large terminals
