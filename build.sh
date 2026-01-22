@@ -1,6 +1,5 @@
 #!/bin/bash
 # Build Script for vterm-sdl3 terminal emulator
-# This script automates the build process as described in BUILD.md
 
 set -e  # Exit on any error
 set -u  # Treat unset variables as errors
