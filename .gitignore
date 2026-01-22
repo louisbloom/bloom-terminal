@@ -1,0 +1,82 @@
+.cecli*
+.env
+# Autotools-generated files
+aclocal.m4
+autom4te.cache
+config.guess
+config.log
+config.status
+config.sub
+configure
+depcomp
+install-sh
+Makefile.in
+missing
+ylwrap
+config.h.in
+config.h.in~
+compile
+ltmain.sh
+
+# Build directories
+build/
+_build/
+.deps/
+.dirstamp
+build-aux/
+.cache/
+
+# Compiled objects and binaries
+*.o
+*.lo
+*.la
+*.so
+*.so.*
+*.a
+*.exe
+*.out
+vterm-sdl3
+src/vterm-sdl3
+
+# Test binaries
+tests/*.log
+tests/*.trs
+tests/*.exe
+tests/test_*
+
+# Dependency files
+*.d
+*.deps
+
+# Editor files
+*~
+.#*
+*.swp
+*.swo
+\#*#
+.ai.code.prompt.org
+
+# IDE files
+.vscode/
+.idea/
+
+# Documentation build outputs
+docs/_build/
+docs/html/
+docs/latex/
+
+# Temporary files
+core
+*.core
+*.pid
+
+# Backup files
+*.backup
+*.bak
+
+# Package manager files
+*.tar.gz
+*.zip
+
+# Opencode configuration
+opencode.jsonc
