@@ -7,7 +7,7 @@
 #include FT_SFNT_NAMES_H
 #include FT_TRUETYPE_TABLES_H
 #include "common.h"
-#include "font_backend.h"
+#include "font.h"
 #include <cairo/cairo-ft.h>
 #include <cairo/cairo.h>
 #include <fontconfig/fontconfig.h>
@@ -81,9 +81,9 @@ static bool load_font_file(const char *font_path, unsigned char **data, size_t *
 }
 
 // Helper function to free a glyph bitmap
-static void ft_free_glyph_bitmap(FontBackend *backend, GlyphBitmap *bitmap)
+static void ft_free_glyph_bitmap(Font *font, GlyphBitmap *bitmap)
 {
-    (void)backend; // Unused
+    (void)font; // Unused
 
     if (!bitmap)
         return;
@@ -194,10 +194,10 @@ static bool check_colr_table(FT_Face face)
 }
 
 // Initialize FreeType/Cairo font
-static void *ft_init_font(FontBackend *backend, const char *font_path,
+static void *ft_init_font(Font *font, const char *font_path,
                           float font_size, FontStyle style, const FontOptions *options)
 {
-    (void)backend; // Unused
+    (void)font; // Unused
 
     vlog("Initializing FreeType/Cairo font from %s, size %.1f, style %d\n", font_path, font_size, style);
 
@@ -290,9 +290,9 @@ static void *ft_init_font(FontBackend *backend, const char *font_path,
 }
 
 // Destroy FreeType/Cairo font
-static void ft_destroy_font(FontBackend *backend, void *font_data)
+static void ft_destroy_font(Font *font, void *font_data)
 {
-    (void)backend; // Unused
+    (void)font; // Unused
 
     FtFontData *ft_data = (FtFontData *)font_data;
     if (!ft_data)
@@ -307,9 +307,9 @@ static void ft_destroy_font(FontBackend *backend, void *font_data)
 }
 
 // Get font metrics
-static bool ft_get_metrics(FontBackend *backend, void *font_data, FontMetrics *metrics)
+static bool ft_get_metrics(Font *font, void *font_data, FontMetrics *metrics)
 {
-    (void)backend; // Unused
+    (void)font; // Unused
 
     FtFontData *ft_data = (FtFontData *)font_data;
     if (!ft_data || !metrics)
@@ -357,11 +357,11 @@ m_done:;
 }
 
 // Render glyphs using FreeType directly (unified function for single/multiple codepoints)
-static GlyphBitmap *ft_render_glyph(FontBackend *backend, void *font_data,
+static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
                                     uint32_t *codepoints, int codepoint_count,
                                     uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
 {
-    (void)backend; // Unused
+    (void)font; // Unused
 
     FtFontData *ft_data = (FtFontData *)font_data;
     if (!ft_data || !codepoints || codepoint_count <= 0)
@@ -727,10 +727,10 @@ cairo_fallback:
 }
 
 // Get glyph info without rendering
-static bool ft_get_glyph_info(FontBackend *backend, void *font_data, uint32_t codepoint,
+static bool ft_get_glyph_info(Font *font, void *font_data, uint32_t codepoint,
                               int *advance, int *left_bearing, int *top_bearing)
 {
-    (void)backend; // Unused
+    (void)font; // Unused
 
     FtFontData *ft_data = (FtFontData *)font_data;
     if (!ft_data)
@@ -759,18 +759,18 @@ static bool ft_get_glyph_info(FontBackend *backend, void *font_data, uint32_t co
     return true;
 }
 
-// FreeType/Cairo backend implementation
-FontBackend ft_backend = {
+// FreeType/Cairo font implementation
+Font font = {
     .name = "freetype/cairo",
-    .init = font_backend_init,
-    .destroy = font_backend_destroy,
+    .init = font_init,
+    .destroy = font_destroy,
     .init_font = ft_init_font,
     .destroy_font = ft_destroy_font,
     .get_metrics = ft_get_metrics,
     .render_glyphs = ft_render_glyph, // Unified renderer
     .get_glyph_info = ft_get_glyph_info,
     .free_glyph_bitmap = ft_free_glyph_bitmap,
-    .load_font = font_backend_load_font,
-    .get_style_metrics = font_backend_get_metrics,
-    .has_style = font_backend_has_style
+    .load_font = font_load_font,
+    .get_style_metrics = font_get_metrics,
+    .has_style = font_has_style
 };

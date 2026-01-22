@@ -1,5 +1,5 @@
-#ifndef FONT_BACKEND_H
-#define FONT_BACKEND_H
+#ifndef FONT_H
+#define FONT_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -49,12 +49,12 @@ typedef struct FontOptions
     int dpi_y;         // Vertical DPI for HiDPI support
 } FontOptions;
 
-// Abstract font backend interface
-struct FontBackend;
-typedef struct FontBackend FontBackend;
+// Abstract font font interface
+struct Font;
+typedef struct Font Font;
 
 // Backend interface definition
-struct FontBackend
+struct Font
 {
     const char *name;
 
@@ -63,57 +63,57 @@ struct FontBackend
     FontMetrics metrics[FONT_STYLE_COUNT]; // Metrics for each font style
     uint32_t loaded_styles;                // Bitmask of loaded font styles
 
-    // Initialize backend
-    bool (*init)(FontBackend *backend);
+    // Initialize font
+    bool (*init)(Font *font);
 
-    // Destroy backend
-    void (*destroy)(FontBackend *backend);
+    // Destroy font
+    void (*destroy)(Font *font);
 
-    // Initialize backend-specific data for a font style
-    void *(*init_font)(FontBackend *backend, const char *font_path,
+    // Initialize font-specific data for a font style
+    void *(*init_font)(Font *font, const char *font_path,
                        float font_size, FontStyle style, const FontOptions *options);
 
-    // Destroy backend-specific data
-    void (*destroy_font)(FontBackend *backend, void *font_data);
+    // Destroy font-specific data
+    void (*destroy_font)(Font *font, void *font_data);
 
     // Get metrics for a font
-    bool (*get_metrics)(FontBackend *backend, void *font_data, FontMetrics *metrics);
+    bool (*get_metrics)(Font *font, void *font_data, FontMetrics *metrics);
 
     // Unified glyph renderer for both single and multiple codepoints
-    GlyphBitmap *(*render_glyphs)(FontBackend *backend, void *font_data,
+    GlyphBitmap *(*render_glyphs)(Font *font, void *font_data,
                                   uint32_t *codepoints, int codepoint_count,
                                   uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
 
     // Get glyph metrics without rendering
-    bool (*get_glyph_info)(FontBackend *backend, void *font_data, uint32_t codepoint,
+    bool (*get_glyph_info)(Font *font, void *font_data, uint32_t codepoint,
                            int *advance, int *left_bearing, int *top_bearing);
 
     // Free a glyph bitmap
-    void (*free_glyph_bitmap)(FontBackend *backend, GlyphBitmap *bitmap);
+    void (*free_glyph_bitmap)(Font *font, GlyphBitmap *bitmap);
 
     // Font loading functions
-    bool (*load_font)(FontBackend *backend, FontStyle style,
+    bool (*load_font)(Font *font, FontStyle style,
                       const char *font_path, float font_size, const FontOptions *options);
 
     // Get metrics for a specific style
-    const FontMetrics *(*get_style_metrics)(FontBackend *backend, FontStyle style);
+    const FontMetrics *(*get_style_metrics)(Font *font, FontStyle style);
 
     // Check if a style is loaded
-    bool (*has_style)(FontBackend *backend, FontStyle style);
+    bool (*has_style)(Font *font, FontStyle style);
 };
 
-// Font backend API
-bool font_backend_init(FontBackend *backend);
-void font_backend_destroy(FontBackend *backend);
-bool font_backend_load_font(FontBackend *backend, FontStyle style,
-                            const char *font_path, float font_size, const FontOptions *options);
-const FontMetrics *font_backend_get_metrics(FontBackend *backend, FontStyle style);
-GlyphBitmap *font_backend_render_glyphs(FontBackend *backend, FontStyle style,
-                                        uint32_t *codepoints, int codepoint_count,
-                                        uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
-bool font_backend_has_style(FontBackend *backend, FontStyle style);
+// Font font API
+bool font_init(Font *font);
+void font_destroy(Font *font);
+bool font_load_font(Font *font, FontStyle style,
+                    const char *font_path, float font_size, const FontOptions *options);
+const FontMetrics *font_get_metrics(Font *font, FontStyle style);
+GlyphBitmap *font_render_glyphs(Font *font, FontStyle style,
+                                uint32_t *codepoints, int codepoint_count,
+                                uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
+bool font_has_style(Font *font, FontStyle style);
 
 // Extern declaration for the FreeType backend implementation
-extern FontBackend ft_backend;
+extern Font font;
 
-#endif // FONT_BACKEND_H
+#endif // FONT_H

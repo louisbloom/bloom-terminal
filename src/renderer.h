@@ -1,7 +1,7 @@
 #ifndef RENDERER_H
 #define RENDERER_H
 
-#include "font_backend.h"
+#include "font.h"
 #include "terminal.h"
 #include <SDL3/SDL.h>
 #include <fontconfig/fontconfig.h>
@@ -10,8 +10,8 @@
 typedef struct
 {
     SDL_Renderer *renderer;
-    SDL_Window *window;        // Window handle for DPI detection
-    FontBackend *font_backend; // Font backend directly
+    SDL_Window *window; // Window handle for DPI detection
+    Font *font;         // Font backend directly
     int cell_width;
     int cell_height;
     int char_width;   // Actual character width from font

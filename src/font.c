@@ -1,0 +1,105 @@
+#include "font.h"
+#include "common.h"
+#include <string.h>
+
+// Initialize the font font
+bool font_init(Font *font)
+{
+    if (!font) {
+        return false;
+    }
+
+    font->loaded_styles = 0;
+
+    // Initialize all font data pointers to NULL
+    for (int i = 0; i < FONT_STYLE_COUNT; i++) {
+        font->font_data[i] = NULL;
+        memset(&font->metrics[i], 0, sizeof(FontMetrics));
+    }
+
+    return true;
+}
+
+// Destroy the font font
+void font_destroy(Font *font)
+{
+    if (!font)
+        return;
+
+    // Destroy all loaded font data
+    for (FontStyle style = FONT_STYLE_NORMAL; style < FONT_STYLE_COUNT; style++) {
+        if (font->font_data[style]) {
+            font->destroy_font(font, font->font_data[style]);
+            font->font_data[style] = NULL;
+        }
+    }
+}
+
+// Load a font with a specific style
+bool font_load_font(Font *font, FontStyle style,
+                    const char *font_path, float font_size, const FontOptions *options)
+{
+    if (!font || style >= FONT_STYLE_COUNT || !font_path) {
+        return false;
+    }
+
+    // Unload existing font of this style if present
+    if (font->font_data[style]) {
+        font->destroy_font(font, font->font_data[style]);
+        font->font_data[style] = NULL;
+        font->loaded_styles &= ~(1u << style);
+    }
+
+    // Load the font
+    void *font_data = font->init_font(font, font_path,
+                                      font_size, style, options);
+    if (!font_data) {
+        return false;
+    }
+
+    // Get font metrics
+    if (!font->get_metrics(font, font_data,
+                           &font->metrics[style])) {
+        font->destroy_font(font, font_data);
+        return false;
+    }
+
+    font->font_data[style] = font_data;
+    font->loaded_styles |= (1u << style);
+
+    vlog("Loaded font style %d from %s\n", style, font_path);
+
+    return true;
+}
+
+// Get metrics for a specific style
+const FontMetrics *font_get_metrics(Font *font, FontStyle style)
+{
+    if (!font || style >= FONT_STYLE_COUNT ||
+        !(font->loaded_styles & (1u << style))) {
+        return NULL;
+    }
+
+    return &font->metrics[style];
+}
+
+// Unified glyph renderer for single and multiple codepoints
+GlyphBitmap *font_render_glyphs(Font *font, FontStyle style,
+                                uint32_t *codepoints, int codepoint_count,
+                                uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    if (!font || style >= FONT_STYLE_COUNT ||
+        !(font->loaded_styles & (1u << style)) || !codepoints || codepoint_count <= 0) {
+        return NULL;
+    }
+
+    return font->render_glyphs(font, font->font_data[style],
+                               codepoints, codepoint_count, fg_r, fg_g, fg_b);
+}
+
+// Check if a style is loaded
+bool font_has_style(Font *font, FontStyle style)
+{
+    return font && style < FONT_STYLE_COUNT &&
+           (font->loaded_styles & (1u << style));
+}

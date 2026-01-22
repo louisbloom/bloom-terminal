@@ -1,6 +1,6 @@
 #include "renderer.h"
 #include "common.h"
-#include "font_backend.h"
+#include "font.h"
 #include "font_resolver.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -106,7 +106,7 @@ Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
 
     rend->renderer = sdl_renderer;
     rend->window = window;
-    rend->font_backend = NULL;
+    rend->font = NULL;
     rend->cell_width = 0;
     rend->cell_height = 0;
     rend->char_width = 0;
@@ -118,8 +118,8 @@ Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
     rend->debug_grid = 0; // Initialize debug grid to off
 
     // Initialize font backend with FreeType/Cairo backend
-    rend->font_backend = &ft_backend;
-    if (!font_backend_init(rend->font_backend)) {
+    rend->font = &ft_backend;
+    if (!font_init(rend->font)) {
         vlog("Failed to initialize font backend\n");
         free(rend);
         return NULL;
@@ -131,8 +131,8 @@ Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
 void renderer_destroy(Renderer *rend)
 {
     if (rend) {
-        if (rend->font_backend) {
-            font_backend_destroy(rend->font_backend);
+        if (rend->font) {
+            font_destroy(rend->font);
         }
         free(rend);
     }
@@ -180,7 +180,7 @@ int renderer_load_fonts(Renderer *rend)
     // Load normal monospace font
     FontResolutionResult result;
     if (font_resolver_find_font(FONT_TYPE_NORMAL, &result) == 0) {
-        if (font_backend_load_font(rend->font_backend, FONT_STYLE_NORMAL, result.font_path, font_size, &options)) {
+        if (font_load_font(rend->font, FONT_STYLE_NORMAL, result.font_path, font_size, &options)) {
             vlog("Normal font loaded successfully from %s\n", result.font_path);
         } else {
             fprintf(stderr, "Failed to load normal font from %s\n", result.font_path);
@@ -197,7 +197,7 @@ int renderer_load_fonts(Renderer *rend)
 
     // Load bold font
     if (font_resolver_find_font(FONT_TYPE_BOLD, &result) == 0) {
-        if (font_backend_load_font(rend->font_backend, FONT_STYLE_BOLD, result.font_path, font_size, &options)) {
+        if (font_load_font(rend->font, FONT_STYLE_BOLD, result.font_path, font_size, &options)) {
             vlog("Bold font loaded successfully from %s\n", result.font_path);
         } else {
             vlog("Failed to load bold font from %s\n", result.font_path);
@@ -207,7 +207,7 @@ int renderer_load_fonts(Renderer *rend)
 
     // Load emoji font
     if (font_resolver_find_font(FONT_TYPE_EMOJI, &result) == 0) {
-        if (font_backend_load_font(rend->font_backend, FONT_STYLE_EMOJI, result.font_path, font_size, &options)) {
+        if (font_load_font(rend->font, FONT_STYLE_EMOJI, result.font_path, font_size, &options)) {
             vlog("Emoji font loaded successfully from %s\n", result.font_path);
         } else {
             vlog("Failed to load emoji font from %s\n", result.font_path);
@@ -219,7 +219,7 @@ int renderer_load_fonts(Renderer *rend)
     font_resolver_cleanup();
 
     // Calculate cell dimensions from font metrics using normal font
-    const FontMetrics *metrics = font_backend_get_metrics(rend->font_backend, FONT_STYLE_NORMAL);
+    const FontMetrics *metrics = font_get_metrics(rend->font, FONT_STYLE_NORMAL);
     if (metrics) {
         rend->font_ascent = metrics->ascent;
         rend->font_descent = metrics->descent;
@@ -237,9 +237,9 @@ int renderer_load_fonts(Renderer *rend)
 
         // Log which fonts were successfully loaded
         vlog("Font loading summary:\n");
-        vlog("  Normal font: %s\n", font_backend_has_style(rend->font_backend, FONT_STYLE_NORMAL) ? "Loaded" : "Not loaded");
-        vlog("  Bold font: %s\n", font_backend_has_style(rend->font_backend, FONT_STYLE_BOLD) ? "Loaded" : "Not loaded");
-        vlog("  Emoji font: %s\n", font_backend_has_style(rend->font_backend, FONT_STYLE_EMOJI) ? "Loaded" : "Not loaded");
+        vlog("  Normal font: %s\n", font_has_style(rend->font, FONT_STYLE_NORMAL) ? "Loaded" : "Not loaded");
+        vlog("  Bold font: %s\n", font_has_style(rend->font, FONT_STYLE_BOLD) ? "Loaded" : "Not loaded");
+        vlog("  Emoji font: %s\n", font_has_style(rend->font, FONT_STYLE_EMOJI) ? "Loaded" : "Not loaded");
     } else {
         vlog("ERROR: No font available for metrics calculation\n");
         return -1;
@@ -250,7 +250,7 @@ int renderer_load_fonts(Renderer *rend)
 
 void renderer_draw_terminal(Renderer *rend, Terminal *term)
 {
-    if (!rend || !term || !font_backend_has_style(rend->font_backend, FONT_STYLE_NORMAL)) {
+    if (!rend || !term || !font_has_style(rend->font, FONT_STYLE_NORMAL)) {
         vlog("Renderer draw terminal failed: invalid parameters\n");
         return;
     }
@@ -351,12 +351,12 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                 // Select appropriate font style
                 FontStyle style = FONT_STYLE_NORMAL;
                 const char *font_type = "normal";
-                if (cell.attrs.bold && font_backend_has_style(rend->font_backend, FONT_STYLE_BOLD)) {
+                if (cell.attrs.bold && font_has_style(rend->font, FONT_STYLE_BOLD)) {
                     style = FONT_STYLE_BOLD;
                     font_type = "bold";
                 }
 
-                if ((codepoint >= 0x1F000 && codepoint <= 0x1F9FF) && font_backend_has_style(rend->font_backend, FONT_STYLE_EMOJI)) {
+                if ((codepoint >= 0x1F000 && codepoint <= 0x1F9FF) && font_has_style(rend->font, FONT_STYLE_EMOJI)) {
                     style = FONT_STYLE_EMOJI;
                     font_type = "emoji";
                 }
@@ -364,15 +364,15 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                 vlog("  Selected font: %s (style=%d)\n", font_type, style);
 
                 // Render glyph using font backend to get bitmap
-                GlyphBitmap *glyph_bitmap = font_backend_render_glyphs(rend->font_backend, style, &codepoint, 1, r, g, b);
+                GlyphBitmap *glyph_bitmap = font_render_glyphs(rend->font, style, &codepoint, 1, r, g, b);
                 if (glyph_bitmap) {
                     // Create texture from glyph bitmap
                     SDL_Texture *texture = create_texture_from_glyph_bitmap(rend, glyph_bitmap);
                     if (texture) {
                         // Get font metrics for positioning
-                        const FontMetrics *metrics = font_backend_get_metrics(rend->font_backend, style);
+                        const FontMetrics *metrics = font_get_metrics(rend->font, style);
                         if (!metrics) {
-                            metrics = font_backend_get_metrics(rend->font_backend, FONT_STYLE_NORMAL);
+                            metrics = font_get_metrics(rend->font, FONT_STYLE_NORMAL);
                         }
 
                         if (metrics) {
@@ -398,7 +398,7 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                         SDL_DestroyTexture(texture);
                     }
                     // Free the glyph bitmap
-                    rend->font_backend->free_glyph_bitmap(rend->font_backend, glyph_bitmap);
+                    rend->font->free_glyph_bitmap(rend->font, glyph_bitmap);
                 }
             }
 
