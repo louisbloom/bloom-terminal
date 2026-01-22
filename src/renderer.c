@@ -118,7 +118,7 @@ Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
     rend->debug_grid = 0; // Initialize debug grid to off
 
     // Initialize font backend with FreeType/Cairo backend
-    rend->font = &ft_backend;
+    rend->font = &font;
     if (!font_init(rend->font)) {
         vlog("Failed to initialize font backend\n");
         free(rend);

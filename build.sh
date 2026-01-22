@@ -16,7 +16,6 @@ PROJECT_NAME="vterm-sdl3"
 BUILD_DIR="build"
 INSTALL_PREFIX="$HOME/.local"
 ENABLE_DEBUG=true
-YES_TO_ALL=false
 PARALLEL_JOBS=$(nproc)
 
 # Logging functions
@@ -60,9 +59,6 @@ generate_configure() {
         log_info "Removing existing configure script"
         rm -f configure
     fi
-    
-    # Fix configure.ac before generating
-    fix_configure_ac
     
     autoreconf -fvi
     
@@ -118,12 +114,19 @@ configure_build() {
 
 # Build the project
 build_project() {
+    local use_bear=${1:-false}
+    
     log_info "Building project..."
     
     cd "$BUILD_DIR"
     
-    log_info "Running make with $PARALLEL_JOBS parallel jobs"
-    make -j"$PARALLEL_JOBS"
+    if [ "$use_bear" = true ]; then
+        log_info "Generating compile_commands.json with bear..."
+        bear -- make -j"$PARALLEL_JOBS"
+    else
+        log_info "Running make with $PARALLEL_JOBS parallel jobs"
+        make -j"$PARALLEL_JOBS"
+    fi
     
     if [ $? -ne 0 ]; then
         log_error "Build failed"
@@ -185,8 +188,12 @@ main() {
     # Parse command line arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --install-deps)
-                install_dependencies
+            --install)
+                INSTALL_ONLY=true
+                shift
+                ;;
+            --bear)
+                USE_BEAR=true
                 shift
                 ;;
             --no-debug)
@@ -197,27 +204,13 @@ main() {
                 INSTALL_PREFIX="${1#*=}"
                 shift
                 ;;
-            --run)
-                RUN_APP=true
-                shift
-                ;;
-            -y|--yes)
-                YES_TO_ALL=true
-                shift
-                ;;
-            --diagnose)
-                diagnose_packages
-                exit 0
-                ;;
             --help)
                 echo "Usage: $0 [options]"
                 echo "Options:"
-                echo "  --install-deps    Install dependencies before building"
+                echo "  --install         Only install the project (skip build and run)"
+                echo "  --bear            Generate compile_commands.json using bear"
                 echo "  --no-debug        Disable debug build"
                 echo "  --prefix=PATH     Set installation prefix (default: $HOME/.local)"
-                echo "  --run             Run the application after building"
-                echo "  -y, --yes         Answer yes to all prompts (auto-install)"
-                echo "  --diagnose        Run package diagnosis to find correct names"
                 echo "  --help            Show this help message"
                 exit 0
                 ;;
@@ -232,45 +225,48 @@ main() {
     # Check OS
     check_os
     
-    # Generate configure script
-    if ! generate_configure; then
-        exit 1
-    fi
-    
-    # Configure build
-    if ! configure_build; then
-        exit 1
-    fi
-    
-    # Build project
-    if ! build_project; then
-        exit 1
-    fi
-    
-    # Install project (optional)
-    if [ "$YES_TO_ALL" = true ]; then
-        log_info "Auto-installing project to $INSTALL_PREFIX (--yes flag used)"
+    # If --install flag is used, skip build and run steps
+    if [ "${INSTALL_ONLY:-false}" = true ]; then
+        log_info "Installing project only (--install flag used)"
+        
+        # Generate configure script
+        if ! generate_configure; then
+            exit 1
+        fi
+        
+        # Configure build
+        if ! configure_build; then
+            exit 1
+        fi
+        
+        # Install project (skip build)
+        log_info "Installing project to $INSTALL_PREFIX"
         if ! install_project; then
             log_error "Installation failed"
             exit 1
         fi
     else
-        read -p "Do you want to install the project to $INSTALL_PREFIX? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            if ! install_project; then
-                log_error "Installation failed"
+        # Generate configure script
+        if ! generate_configure; then
+            exit 1
+        fi
+        
+        # Configure build
+        if ! configure_build; then
+            exit 1
+        fi
+        
+        # Build project with bear if requested
+        if [ "${USE_BEAR:-false}" = true ]; then
+            # Build project with bear
+            if ! build_project true; then
                 exit 1
             fi
         else
-            log_info "Skipping installation"
-        fi
-    fi
-    
-    # Run application if requested
-    if [ "${RUN_APP:-false}" = true ]; then
-        if ! run_application; then
-            exit 1
+            # Build project normally
+            if ! build_project; then
+                exit 1
+            fi
         fi
     fi
     
