@@ -963,6 +963,60 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
         load_flags |= FT_LOAD_NO_HINTING;
     }
 
+    // If COLR and FreeType supports FT_LOAD_COLOR, try color render path first
+    if (ft_data->has_colr && FT_HAS_COLOR(face)) {
+        FT_Error color_err = FT_Load_Glyph(face, glyph_index, load_flags | FT_LOAD_COLOR);
+        if (color_err == 0) {
+            color_err = FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
+            if (color_err == 0 && face->glyph->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA) {
+                // Convert BGRA bitmap to RGBA
+                GlyphBitmap *glyph_bitmap = malloc(sizeof(GlyphBitmap));
+                if (!glyph_bitmap)
+                    return NULL;
+
+                FT_Bitmap *bitmap = &face->glyph->bitmap;
+                glyph_bitmap->width = bitmap->width;
+                glyph_bitmap->height = bitmap->rows;
+                glyph_bitmap->x_offset = face->glyph->bitmap_left;
+                glyph_bitmap->y_offset = face->glyph->bitmap_top;
+                glyph_bitmap->advance = (int)(face->glyph->advance.x >> 6);
+                glyph_bitmap->glyph_id = glyph_index;
+
+                if (glyph_bitmap->width <= 0 || glyph_bitmap->height <= 0) {
+                    glyph_bitmap->pixels = NULL;
+                    return glyph_bitmap;
+                }
+
+                glyph_bitmap->pixels = malloc(glyph_bitmap->width * glyph_bitmap->height * 4);
+                if (!glyph_bitmap->pixels) {
+                    free(glyph_bitmap);
+                    return NULL;
+                }
+
+                // BGRA -> RGBA
+                unsigned char *src = bitmap->buffer;
+                unsigned char *dst = glyph_bitmap->pixels;
+                for (int y = 0; y < (int)bitmap->rows; y++) {
+                    unsigned char *srow = src + y * bitmap->pitch;
+                    unsigned char *drow = dst + y * glyph_bitmap->width * 4;
+                    for (int x = 0; x < (int)bitmap->width; x++) {
+                        unsigned char b = srow[x * 4 + 0];
+                        unsigned char g = srow[x * 4 + 1];
+                        unsigned char r = srow[x * 4 + 2];
+                        unsigned char a = srow[x * 4 + 3];
+                        drow[x * 4 + 0] = r;
+                        drow[x * 4 + 1] = g;
+                        drow[x * 4 + 2] = b;
+                        drow[x * 4 + 3] = a;
+                    }
+                }
+
+                return glyph_bitmap;
+            }
+        }
+        // fallthrough to non-color rendering if unsupported
+    }
+
     FT_Error error = FT_Load_Glyph(face, glyph_index, load_flags);
     if (error) {
         vlog("rasterize_glyph_index: Failed to load glyph index %u: error %d\n", glyph_index, error);
