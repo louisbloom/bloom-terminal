@@ -97,6 +97,37 @@ GlyphBitmap *font_render_glyphs(Font *font, FontStyle style,
                                codepoints, codepoint_count, fg_r, fg_g, fg_b);
 }
 
+// Render shaped text (multi-codepoint runs)
+ShapedGlyphs *font_render_shaped_text(Font *font, FontStyle style,
+                                      uint32_t *codepoints, int count,
+                                      uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!font || style >= FONT_STYLE_COUNT ||
+        !(font->loaded_styles & (1u << style)) || !codepoints || count <= 0) {
+        return NULL;
+    }
+
+    if (!font->render_shaped)
+        return NULL;
+
+    return font->render_shaped(font, font->font_data[style], codepoints, count, r, g, b);
+}
+
+// Set variable font axis value
+bool font_set_variation_axis(Font *font, FontStyle style,
+                             const char *axis_tag, float value)
+{
+    if (!font || style >= FONT_STYLE_COUNT ||
+        !(font->loaded_styles & (1u << style)) || !axis_tag) {
+        return false;
+    }
+
+    if (!font->set_variation_axis)
+        return false;
+
+    return font->set_variation_axis(font, font->font_data[style], axis_tag, value);
+}
+
 // Check if a style is loaded
 bool font_has_style(Font *font, FontStyle style)
 {

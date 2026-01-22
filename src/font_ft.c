@@ -657,6 +657,226 @@ static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
     return glyph_bitmap_fallback;
 }
 
+// Helper: rasterize a glyph by glyph index
+static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_index,
+                                          uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    if (!ft_data || !ft_data->ft_face)
+        return NULL;
+
+    FT_Face face = ft_data->ft_face;
+
+    FT_Int32 load_flags = FT_LOAD_DEFAULT;
+    if (ft_data->antialias) {
+        load_flags |= FT_LOAD_TARGET_NORMAL;
+    } else {
+        load_flags |= FT_LOAD_TARGET_MONO;
+    }
+
+    if (ft_data->hinting) {
+        switch (ft_data->hint_style) {
+        case FC_HINT_NONE:
+            load_flags |= FT_LOAD_NO_HINTING;
+            break;
+        case FC_HINT_SLIGHT:
+            load_flags |= FT_LOAD_TARGET_LIGHT;
+            break;
+        case FC_HINT_MEDIUM:
+        case FC_HINT_FULL:
+            load_flags |= FT_LOAD_TARGET_NORMAL;
+            break;
+        }
+    } else {
+        load_flags |= FT_LOAD_NO_HINTING;
+    }
+
+    FT_Error error = FT_Load_Glyph(face, glyph_index, load_flags);
+    if (error) {
+        vlog("rasterize_glyph_index: Failed to load glyph index %u: error %d\n", glyph_index, error);
+        return NULL;
+    }
+
+    // Render glyph to bitmap
+    error = FT_Render_Glyph(face->glyph, ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO);
+    if (error) {
+        vlog("rasterize_glyph_index: Failed to render glyph index %u: error %d\n", glyph_index, error);
+        return NULL;
+    }
+
+    FT_GlyphSlot slot = face->glyph;
+    FT_Bitmap *bitmap = &slot->bitmap;
+
+    GlyphBitmap *glyph_bitmap = malloc(sizeof(GlyphBitmap));
+    if (!glyph_bitmap)
+        return NULL;
+
+    glyph_bitmap->width = bitmap->width;
+    glyph_bitmap->height = bitmap->rows;
+    glyph_bitmap->x_offset = slot->bitmap_left;
+    glyph_bitmap->y_offset = slot->bitmap_top;
+    glyph_bitmap->advance = (int)(slot->advance.x >> 6);
+
+    if (glyph_bitmap->width <= 0 || glyph_bitmap->height <= 0) {
+        glyph_bitmap->pixels = NULL;
+        return glyph_bitmap;
+    }
+
+    glyph_bitmap->pixels = malloc(glyph_bitmap->width * glyph_bitmap->height * 4);
+    if (!glyph_bitmap->pixels) {
+        free(glyph_bitmap);
+        return NULL;
+    }
+
+    if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
+        for (int y = 0; y < (int)bitmap->rows; y++) {
+            unsigned char *src_row = bitmap->buffer + y * bitmap->pitch;
+            unsigned char *dst_row = glyph_bitmap->pixels + y * glyph_bitmap->width * 4;
+            for (int x = 0; x < (int)bitmap->width; x++) {
+                unsigned char alpha = src_row[x];
+                dst_row[x * 4 + 0] = fg_r;
+                dst_row[x * 4 + 1] = fg_g;
+                dst_row[x * 4 + 2] = fg_b;
+                dst_row[x * 4 + 3] = alpha;
+            }
+        }
+    } else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
+        for (int y = 0; y < (int)bitmap->rows; y++) {
+            unsigned char *src_row = bitmap->buffer + y * bitmap->pitch;
+            unsigned char *dst_row = glyph_bitmap->pixels + y * glyph_bitmap->width * 4;
+            for (int x = 0; x < (int)bitmap->width; x++) {
+                unsigned char byte = src_row[x >> 3];
+                unsigned char bit = (byte >> (7 - (x & 7))) & 1;
+                unsigned char alpha = bit ? 255 : 0;
+                dst_row[x * 4 + 0] = fg_r;
+                dst_row[x * 4 + 1] = fg_g;
+                dst_row[x * 4 + 2] = fg_b;
+                dst_row[x * 4 + 3] = alpha;
+            }
+        }
+    } else {
+        free(glyph_bitmap->pixels);
+        free(glyph_bitmap);
+        return NULL;
+    }
+
+    return glyph_bitmap;
+}
+
+// Render a shaped run: shape with HarfBuzz, rasterize each glyph with FreeType
+static ShapedGlyphs *ft_render_shaped(Font *font, void *font_data,
+                                      uint32_t *codepoints, int codepoint_count,
+                                      uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    (void)font;
+    FtFontData *ft_data = (FtFontData *)font_data;
+    if (!ft_data || !ft_data->hb_font || !codepoints || codepoint_count <= 0)
+        return NULL;
+
+    hb_buffer_t *buf = hb_buffer_create();
+    if (!buf)
+        return NULL;
+
+    hb_buffer_add_utf32(buf, codepoints, codepoint_count, 0, codepoint_count);
+    hb_buffer_guess_segment_properties(buf);
+
+    hb_shape(ft_data->hb_font, buf, NULL, 0);
+
+    unsigned int glyph_count = 0;
+    hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, &glyph_count);
+    hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(buf, &glyph_count);
+
+    if (!glyph_info || glyph_count == 0) {
+        hb_buffer_destroy(buf);
+        return NULL;
+    }
+
+    ShapedGlyphs *run = calloc(1, sizeof(ShapedGlyphs));
+    if (!run) {
+        hb_buffer_destroy(buf);
+        return NULL;
+    }
+
+    run->num_glyphs = (int)glyph_count;
+    run->bitmaps = calloc(glyph_count, sizeof(GlyphBitmap *));
+    run->x_positions = calloc(glyph_count, sizeof(int));
+    run->y_positions = calloc(glyph_count, sizeof(int));
+    run->x_advances = calloc(glyph_count, sizeof(int));
+    run->total_advance = 0;
+
+    int32_t cursor_x = 0, cursor_y = 0;
+    for (unsigned int i = 0; i < glyph_count; i++) {
+        FT_UInt glyph_index = (FT_UInt)glyph_info[i].codepoint; // glyph id
+
+        // Rasterize glyph
+        GlyphBitmap *gb = rasterize_glyph_index(ft_data, glyph_index, fg_r, fg_g, fg_b);
+        run->bitmaps[i] = gb;
+
+        // Positions/advances are in 26.6 fixed point from HarfBuzz
+        int x_pos = (int)((cursor_x + glyph_pos[i].x_offset) >> 6);
+        int y_pos = (int)((cursor_y + glyph_pos[i].y_offset) >> 6);
+        int x_adv = (int)(glyph_pos[i].x_advance >> 6);
+
+        run->x_positions[i] = x_pos;
+        run->y_positions[i] = y_pos;
+        run->x_advances[i] = x_adv;
+
+        run->total_advance += x_adv;
+
+        cursor_x += glyph_pos[i].x_advance;
+        cursor_y += glyph_pos[i].y_advance;
+    }
+
+    hb_buffer_destroy(buf);
+    return run;
+}
+
+// Set a single variation axis value
+static bool ft_set_variation_axis(Font *font, void *font_data, const char *axis_tag, float value)
+{
+    (void)font;
+    FtFontData *ft_data = (FtFontData *)font_data;
+    if (!ft_data || !ft_data->ft_face || !axis_tag)
+        return false;
+
+    if (strlen(axis_tag) < 4)
+        return false;
+
+    FT_MM_Var *mm_var = NULL;
+    FT_Error err = FT_Get_MM_Var(ft_data->ft_face, &mm_var);
+    if (err != 0 || !mm_var)
+        return false;
+
+    FT_Fixed *coords = malloc(mm_var->num_axis * sizeof(FT_Fixed));
+    if (!coords) {
+        FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
+        return false;
+    }
+
+    for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
+        coords[i] = mm_var->axis[i].def;
+    }
+
+    FT_ULong tag = FT_MAKE_TAG(axis_tag[0], axis_tag[1], axis_tag[2], axis_tag[3]);
+    for (FT_UInt i = 0; i < mm_var->num_axis; i++) {
+        if (mm_var->axis[i].tag == tag) {
+            coords[i] = (FT_Fixed)(value * 65536.0f);
+            break;
+        }
+    }
+
+    err = FT_Set_Var_Design_Coordinates(ft_data->ft_face, mm_var->num_axis, coords);
+    free(coords);
+    FT_Done_MM_Var(ft_data->ft_face->glyph->library, mm_var);
+
+    if (err == 0) {
+        if (ft_data->hb_font)
+            hb_ft_font_changed(ft_data->hb_font);
+        return true;
+    }
+
+    return false;
+}
+
 // Get glyph info without rendering
 static bool ft_get_glyph_info(Font *font, void *font_data, uint32_t codepoint,
                               int *advance, int *left_bearing, int *top_bearing)
@@ -690,7 +910,7 @@ static bool ft_get_glyph_info(Font *font, void *font_data, uint32_t codepoint,
     return true;
 }
 
-// FreeType/Cairo font implementation
+// FreeType font implementation
 Font font = {
     .name = "freetype",
     .init = font_init,
@@ -698,7 +918,9 @@ Font font = {
     .init_font = ft_init_font,
     .destroy_font = ft_destroy_font,
     .get_metrics = ft_get_metrics,
-    .render_glyphs = ft_render_glyph, // Unified renderer
+    .render_glyphs = ft_render_glyph,            // Unified renderer (single codepoint)
+    .render_shaped = ft_render_shaped,           // HarfBuzz-shaped multi-codepoint runs
+    .set_variation_axis = ft_set_variation_axis, // Variable font control
     .get_glyph_info = ft_get_glyph_info,
     .free_glyph_bitmap = ft_free_glyph_bitmap,
     .load_font = font_load_font,

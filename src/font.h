@@ -49,6 +49,17 @@ typedef struct FontOptions
     int dpi_y;         // Vertical DPI for HiDPI support
 } FontOptions;
 
+// NEW: Shaped glyph output structure (for HarfBuzz-shaped runs)
+typedef struct ShapedGlyphs
+{
+    int num_glyphs;
+    GlyphBitmap **bitmaps; // Array of rasterized glyph bitmaps (owned by caller)
+    int *x_positions;      // Pixel x positions for each glyph (relative to run origin)
+    int *y_positions;      // Pixel y positions for each glyph (relative to run origin)
+    int *x_advances;       // Pixel advances for each glyph
+    int total_advance;     // Total run advance in pixels
+} ShapedGlyphs;
+
 // Abstract font font interface
 struct Font;
 typedef struct Font Font;
@@ -84,6 +95,15 @@ struct Font
                                   uint32_t *codepoints, int codepoint_count,
                                   uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
 
+    // NEW: Render shaped multi-codepoint runs (HarfBuzz + FreeType)
+    ShapedGlyphs *(*render_shaped)(Font *font, void *font_data,
+                                   uint32_t *codepoints, int codepoint_count,
+                                   uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
+
+    // NEW: Variable font axis control
+    bool (*set_variation_axis)(Font *font, void *font_data,
+                               const char *axis_tag, float value);
+
     // Get glyph metrics without rendering
     bool (*get_glyph_info)(Font *font, void *font_data, uint32_t codepoint,
                            int *advance, int *left_bearing, int *top_bearing);
@@ -111,6 +131,16 @@ const FontMetrics *font_get_metrics(Font *font, FontStyle style);
 GlyphBitmap *font_render_glyphs(Font *font, FontStyle style,
                                 uint32_t *codepoints, int codepoint_count,
                                 uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
+
+// NEW: Render shaped text (multi-codepoint runs)
+ShapedGlyphs *font_render_shaped_text(Font *font, FontStyle style,
+                                      uint32_t *codepoints, int count,
+                                      uint8_t r, uint8_t g, uint8_t b);
+
+// NEW: Set variable font axis value
+bool font_set_variation_axis(Font *font, FontStyle style,
+                             const char *axis_tag, float value);
+
 bool font_has_style(Font *font, FontStyle style);
 
 // Extern declaration for the FreeType backend implementation

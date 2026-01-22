@@ -345,59 +345,87 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
 
             // Render character if it's printable
             if (pos > 0) {
-                // Get the first codepoint (simplified - handles only first character)
-                uint32_t codepoint = cell.chars[0];
+                // Collect codepoints present in cell
+                uint32_t cps[VTERM_MAX_CHARS_PER_CELL];
+                int cp_count = 0;
+                for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
+                    cps[cp_count++] = cell.chars[i];
+                }
 
-                // Select appropriate font style
+                // Select appropriate font style based on first codepoint and attributes
                 FontStyle style = FONT_STYLE_NORMAL;
                 const char *font_type = "normal";
                 if (cell.attrs.bold && font_has_style(rend->font, FONT_STYLE_BOLD)) {
                     style = FONT_STYLE_BOLD;
                     font_type = "bold";
                 }
-
-                if ((codepoint >= 0x1F000 && codepoint <= 0x1F9FF) && font_has_style(rend->font, FONT_STYLE_EMOJI)) {
-                    style = FONT_STYLE_EMOJI;
-                    font_type = "emoji";
+                if (cp_count > 0) {
+                    uint32_t first_cp = cps[0];
+                    if ((first_cp >= 0x1F000 && first_cp <= 0x1F9FF) && font_has_style(rend->font, FONT_STYLE_EMOJI)) {
+                        style = FONT_STYLE_EMOJI;
+                        font_type = "emoji";
+                    }
                 }
 
                 vlog("  Selected font: %s (style=%d)\n", font_type, style);
 
-                // Render glyph using font backend to get bitmap
+                // If multiple codepoints, try shaped rendering (backend must support it)
+                if (cp_count > 1 && rend->font && rend->font->render_shaped) {
+                    ShapedGlyphs *shaped = font_render_shaped_text(rend->font, style, cps, cp_count, r, g, b);
+                    if (shaped) {
+                        int cell_x = col * rend->cell_width;
+                        int cell_y = row * rend->cell_height;
+
+                        for (int gi = 0; gi < shaped->num_glyphs; gi++) {
+                            GlyphBitmap *gb = shaped->bitmaps[gi];
+                            if (!gb)
+                                continue;
+
+                            int x = cell_x + shaped->x_positions[gi] + gb->x_offset;
+                            int y = cell_y + rend->font_ascent - gb->y_offset;
+
+                            SDL_Texture *tex = create_texture_from_glyph_bitmap(rend, gb);
+                            if (tex) {
+                                SDL_FRect dst = { (float)x, (float)y, (float)gb->width, (float)gb->height };
+                                SDL_RenderTexture(rend->renderer, tex, NULL, &dst);
+                                SDL_DestroyTexture(tex);
+                            }
+
+                            // Free glyph bitmap
+                            rend->font->free_glyph_bitmap(rend->font, gb);
+                        }
+
+                        // Free shaped arrays
+                        free(shaped->bitmaps);
+                        free(shaped->x_positions);
+                        free(shaped->y_positions);
+                        free(shaped->x_advances);
+                        free(shaped);
+                        continue; // done with this cell
+                    }
+                }
+
+                // Fallback: render single glyph (first codepoint)
+                uint32_t codepoint = cps[0];
                 GlyphBitmap *glyph_bitmap = font_render_glyphs(rend->font, style, &codepoint, 1, r, g, b);
                 if (glyph_bitmap) {
-                    // Create texture from glyph bitmap
                     SDL_Texture *texture = create_texture_from_glyph_bitmap(rend, glyph_bitmap);
                     if (texture) {
-                        // Get font metrics for positioning
                         const FontMetrics *metrics = font_get_metrics(rend->font, style);
                         if (!metrics) {
                             metrics = font_get_metrics(rend->font, FONT_STYLE_NORMAL);
                         }
 
                         if (metrics) {
-                            // Calculate cell position
                             int cell_x = col * rend->cell_width;
                             int cell_y = row * rend->cell_height;
-
-                            // Use the normal font's ascent as the global baseline
-                            // glyph_bitmap->y_offset is the distance from baseline to top of glyph (positive above baseline)
-                            // Position the glyph so that the baseline aligns correctly
-                            // Use precise positioning without centering to avoid fractional coordinates that may cause blurring
                             float text_x = (float)cell_x + glyph_bitmap->x_offset;
                             float text_y = (float)cell_y + rend->font_ascent - glyph_bitmap->y_offset;
-
-                            SDL_FRect dest_rect = {
-                                text_x,
-                                text_y,
-                                (float)glyph_bitmap->width,
-                                (float)glyph_bitmap->height
-                            };
+                            SDL_FRect dest_rect = { text_x, text_y, (float)glyph_bitmap->width, (float)glyph_bitmap->height };
                             SDL_RenderTexture(rend->renderer, texture, NULL, &dest_rect);
                         }
                         SDL_DestroyTexture(texture);
                     }
-                    // Free the glyph bitmap
                     rend->font->free_glyph_bitmap(rend->font, glyph_bitmap);
                 }
             }
