@@ -181,6 +181,37 @@ run_application() {
     return 0
 }
 
+# Format source files
+format_sources() {
+    log_info "Formatting source files..."
+    
+    # Format C/C++ files with clang-format
+    if command -v clang-format &> /dev/null; then
+        log_info "Formatting C/C++ files with clang-format..."
+        find src/ -name "*.c" -o -name "*.h" | xargs clang-format -i
+    else
+        log_warn "clang-format not found. Skipping C/C++ formatting."
+    fi
+    
+    # Format shell scripts with shfmt
+    if command -v shfmt &> /dev/null; then
+        log_info "Formatting shell scripts with shfmt..."
+        find examples/ -name "*.sh" | xargs shfmt -w
+    else
+        log_warn "shfmt not found. Skipping shell script formatting."
+    fi
+    
+    # Format markdown files with prettier
+    if command -v prettier &> /dev/null; then
+        log_info "Formatting markdown files with prettier..."
+        find . -name "*.md" | xargs prettier --write
+    else
+        log_warn "prettier not found. Skipping markdown formatting."
+    fi
+    
+    log_info "Formatting completed."
+}
+
 # Main execution
 main() {
     log_info "Starting build process for $PROJECT_NAME"
@@ -204,12 +235,17 @@ main() {
                 INSTALL_PREFIX="${1#*=}"
                 shift
                 ;;
+            --format)
+                format_sources
+                exit 0
+                ;;
             --help)
                 echo "Usage: $0 [options]"
                 echo "Options:"
                 echo "  --install         Only install the project (skip build and run)"
                 echo "  --bear            Generate compile_commands.json using bear"
                 echo "  --no-debug        Disable debug build"
+                echo "  --format          Format source files with clang-format, shfmt, and prettier"
                 echo "  --prefix=PATH     Set installation prefix (default: $HOME/.local)"
                 echo "  --help            Show this help message"
                 exit 0

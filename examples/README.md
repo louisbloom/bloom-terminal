@@ -5,23 +5,26 @@ This directory contains various test files for testing vterm-sdl3 terminal emula
 ## How to Use
 
 1. Build vterm-sdl3:
+
    ```bash
    ./build.sh -y
    ```
 
 2. Run a test:
+
    ```bash
    # Basic test
    cat examples/basic/hello.txt | build/src/vterm-sdl3 -v -
-   
+
    # Color test
    cat examples/basic/colors.txt | build/src/vterm-sdl3 -v -
-   
+
    # All-in-one test
    cat examples/all_in_one.txt | build/src/vterm-sdl3 -v -
    ```
 
 3. For tests that require timing (like scrolling or rapid updates):
+
    ```bash
    # Use a small delay between lines
    while IFS= read -r line; do
@@ -38,27 +41,32 @@ This directory contains various test files for testing vterm-sdl3 terminal emula
 ## Test Categories
 
 ### Basic Tests
+
 - `hello.txt` - Simple text with colors and attributes
 - `colors.txt` - Color palette tests (8, 16, 256, truecolor)
 - `attributes.txt` - Text attributes (bold, italic, underline, etc.)
 - `cursor.txt` - Cursor positioning and movement
 
 ### Advanced Tests
+
 - `scroll.txt` - Terminal scrolling with many lines
 - `altscreen.txt` - Alternate screen buffer
 - `window_title.txt` - Window title setting
 - `cursor_control.txt` - Cursor visibility and shape control
 
 ### Unicode Tests
+
 - `box_drawing.txt` - Box drawing characters
 - `emoji.txt` - Emoji characters
 - `symbols.txt` - Special symbols (mathematical, currency, arrows)
 
 ### Performance Tests
+
 - `large_output.txt` - Large amount of text output
 - `rapid_updates.txt` - Rapid screen updates
 
 ### Comprehensive Test
+
 - `all_in_one.txt` - All features combined in one test
 
 ## Notes
@@ -80,6 +88,7 @@ This directory contains various test files for testing vterm-sdl3 terminal emula
 ## Troubleshooting
 
 If a test doesn't work as expected:
+
 1. Check if vterm-sdl3 was built with debugging: `./build.sh -y`
 2. Run with `-v` flag to see verbose output
 3. Check the terminal capabilities in the source code

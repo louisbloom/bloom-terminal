@@ -1,12 +1,14 @@
 # vterm-sdl3 Build Guide
 
 ## Prerequisites (Fedora)
+
 ```bash
 sudo dnf install -y autoconf automake libtool pkg-config gcc make \
     libvterm-devel SDL3-devel fontconfig-devel
 ```
 
 ## Quick Build with build.sh
+
 ```bash
 # Make the build script executable
 chmod +x build.sh
@@ -28,6 +30,7 @@ chmod +x build.sh
 ```
 
 ## Build Script Options
+
 - `--install`: Only install the project (skip build and run)
 - `--bear`: Generate compile_commands.json using bear
 - `--no-debug`: Disable debug build
@@ -35,7 +38,9 @@ chmod +x build.sh
 - `--help`: Show help message
 
 ## Manual Build Process
+
 If you prefer to build manually without using build.sh:
+
 ```bash
 # Generate build files
 autoreconf -fvi
@@ -50,6 +55,7 @@ make -j$(nproc)
 ```
 
 ## Configuration Options
+
 ```bash
 ../configure \
     --prefix=/usr/local \
@@ -57,6 +63,7 @@ make -j$(nproc)
 ```
 
 ## Development
+
 ```bash
 # Clean and rebuild
 make clean && make -j$(nproc) && make check
