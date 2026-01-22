@@ -22,6 +22,11 @@ typedef struct
     int height;
     VTermState *state; // VTerm state for color conversion
     int debug_grid;    // Debug grid toggle flag
+
+    // Glyph texture cache (simple LRU)
+    struct GlyphCacheEntry *glyph_cache;
+    int glyph_cache_size;
+    uint64_t cache_tick;
 } Renderer;
 
 Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window);

@@ -3,6 +3,9 @@
 #include "font.h"
 #include "font_resolver.h"
 #include <SDL3/SDL.h>
+#include <limits.h>
+#include <stdint.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +56,18 @@ static void convert_vterm_color_to_sdl(const VTermColor *vcol, Uint8 *r, Uint8 *
     }
 }
 
+// Glyph cache entry
+struct GlyphCacheEntry
+{
+    void *font_data;
+    int glyph_id;
+    uint32_t color;
+    SDL_Texture *texture;
+    int w, h;
+    int x_offset, y_offset;
+    uint64_t used;
+};
+
 // Helper function to create an SDL_Texture from a GlyphBitmap
 static SDL_Texture *create_texture_from_glyph_bitmap(Renderer *rend, GlyphBitmap *glyph_bitmap)
 {
@@ -97,6 +112,64 @@ static SDL_Texture *create_texture_from_glyph_bitmap(Renderer *rend, GlyphBitmap
     return texture;
 }
 
+// Cache accessors
+static SDL_Texture *renderer_get_cached_texture(Renderer *rend, void *font_data, int glyph_id, uint32_t color)
+{
+    if (!rend || !rend->glyph_cache)
+        return NULL;
+    uint64_t now = ++rend->cache_tick;
+    for (int i = 0; i < rend->glyph_cache_size; i++) {
+        struct GlyphCacheEntry *e = &rend->glyph_cache[i];
+        if (e->texture && e->font_data == font_data && e->glyph_id == glyph_id && e->color == color) {
+            e->used = now;
+            return e->texture;
+        }
+    }
+    return NULL;
+}
+
+static void renderer_cache_texture(Renderer *rend, void *font_data, int glyph_id, uint32_t color, SDL_Texture *tex, GlyphBitmap *gb)
+{
+    if (!rend || !rend->glyph_cache || !tex)
+        return;
+
+    // Find empty slot or LRU
+    int empty = -1;
+    int lru_idx = -1;
+    uint64_t lru_used = UINT64_MAX;
+    for (int i = 0; i < rend->glyph_cache_size; i++) {
+        struct GlyphCacheEntry *e = &rend->glyph_cache[i];
+        if (!e->texture) {
+            empty = i;
+            break;
+        }
+        if (e->used < lru_used) {
+            lru_used = e->used;
+            lru_idx = i;
+        }
+    }
+
+    int slot = (empty >= 0) ? empty : lru_idx;
+    if (slot < 0)
+        return; // shouldn't happen
+
+    // Evict if needed
+    struct GlyphCacheEntry *e = &rend->glyph_cache[slot];
+    if (e->texture) {
+        SDL_DestroyTexture(e->texture);
+    }
+
+    e->font_data = font_data;
+    e->glyph_id = glyph_id;
+    e->color = color;
+    e->texture = tex;
+    e->w = gb ? gb->width : 0;
+    e->h = gb ? gb->height : 0;
+    e->x_offset = gb ? gb->x_offset : 0;
+    e->y_offset = gb ? gb->y_offset : 0;
+    e->used = ++rend->cache_tick;
+}
+
 Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
 {
     Renderer *rend = malloc(sizeof(Renderer));
@@ -117,10 +190,17 @@ Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
     rend->height = 0;
     rend->debug_grid = 0; // Initialize debug grid to off
 
-    // Initialize font backend with FreeType/Cairo backend
+    // Initialize glyph cache
+    rend->glyph_cache_size = 1024; // reasonable default
+    rend->glyph_cache = calloc(rend->glyph_cache_size, sizeof(*rend->glyph_cache));
+    rend->cache_tick = 0;
+
+    // Initialize font backend with FreeType backend
     rend->font = &font;
     if (!font_init(rend->font)) {
         vlog("Failed to initialize font backend\n");
+        if (rend->glyph_cache)
+            free(rend->glyph_cache);
         free(rend);
         return NULL;
     }
@@ -131,6 +211,17 @@ Renderer *renderer_init(SDL_Renderer *sdl_renderer, SDL_Window *window)
 void renderer_destroy(Renderer *rend)
 {
     if (rend) {
+        // Destroy glyph cache textures
+        if (rend->glyph_cache) {
+            for (int i = 0; i < rend->glyph_cache_size; i++) {
+                if (rend->glyph_cache[i].texture) {
+                    SDL_DestroyTexture(rend->glyph_cache[i].texture);
+                }
+            }
+            free(rend->glyph_cache);
+            rend->glyph_cache = NULL;
+        }
+
         if (rend->font) {
             font_destroy(rend->font);
         }
@@ -384,14 +475,22 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                             int x = cell_x + shaped->x_positions[gi] + gb->x_offset;
                             int y = cell_y + rend->font_ascent - gb->y_offset;
 
-                            SDL_Texture *tex = create_texture_from_glyph_bitmap(rend, gb);
+                            // Try cache first
+                            void *font_data = rend->font ? rend->font->font_data[style] : NULL;
+                            uint32_t color_key = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                            SDL_Texture *tex = renderer_get_cached_texture(rend, font_data, gb->glyph_id, color_key);
+                            if (!tex) {
+                                tex = create_texture_from_glyph_bitmap(rend, gb);
+                                if (tex)
+                                    renderer_cache_texture(rend, font_data, gb->glyph_id, color_key, tex, gb);
+                            }
+
                             if (tex) {
                                 SDL_FRect dst = { (float)x, (float)y, (float)gb->width, (float)gb->height };
                                 SDL_RenderTexture(rend->renderer, tex, NULL, &dst);
-                                SDL_DestroyTexture(tex);
                             }
 
-                            // Free glyph bitmap
+                            // Free glyph bitmap (texture stays cached)
                             rend->font->free_glyph_bitmap(rend->font, gb);
                         }
 
@@ -409,7 +508,15 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                 uint32_t codepoint = cps[0];
                 GlyphBitmap *glyph_bitmap = font_render_glyphs(rend->font, style, &codepoint, 1, r, g, b);
                 if (glyph_bitmap) {
-                    SDL_Texture *texture = create_texture_from_glyph_bitmap(rend, glyph_bitmap);
+                    // Try cache first
+                    void *font_data_single = rend->font ? rend->font->font_data[style] : NULL;
+                    uint32_t color_key_single = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                    SDL_Texture *texture = renderer_get_cached_texture(rend, font_data_single, glyph_bitmap->glyph_id, color_key_single);
+                    if (!texture) {
+                        texture = create_texture_from_glyph_bitmap(rend, glyph_bitmap);
+                        if (texture)
+                            renderer_cache_texture(rend, font_data_single, glyph_bitmap->glyph_id, color_key_single, texture, glyph_bitmap);
+                    }
                     if (texture) {
                         const FontMetrics *metrics = font_get_metrics(rend->font, style);
                         if (!metrics) {
@@ -424,7 +531,6 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                             SDL_FRect dest_rect = { text_x, text_y, (float)glyph_bitmap->width, (float)glyph_bitmap->height };
                             SDL_RenderTexture(rend->renderer, texture, NULL, &dest_rect);
                         }
-                        SDL_DestroyTexture(texture);
                     }
                     rend->font->free_glyph_bitmap(rend->font, glyph_bitmap);
                 }

@@ -34,6 +34,7 @@ typedef struct GlyphBitmap
     int x_offset; // Horizontal offset from cell origin
     int y_offset; // Vertical offset from baseline
     int advance;  // Horizontal advance to next glyph
+    int glyph_id; // Underlying font glyph id (if available)
 } GlyphBitmap;
 
 // Font options structure

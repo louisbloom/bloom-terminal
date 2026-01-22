@@ -390,6 +390,7 @@ static GlyphBitmap *render_colr_glyph(FtFontData *ft_data, FT_UInt glyph_index,
     out->y_offset = max_y; // baseline distance
     out->advance = advance;
     out->pixels = calloc(out_w * out_h, 4);
+    out->glyph_id = glyph_index;
     if (!out->pixels) {
         free(out);
         for (int i = 0; i < layer_count; i++)
@@ -409,9 +410,9 @@ static GlyphBitmap *render_colr_glyph(FtFontData *ft_data, FT_UInt glyph_index,
         uint8_t pb = lb->color.blue;
         uint8_t pa = lb->color.alpha;
 
-        for (int y = 0; y < bmp->rows; y++) {
+        for (unsigned int y = 0; y < bmp->rows; y++) {
             unsigned char *src = bmp->buffer + y * bmp->pitch;
-            for (int x = 0; x < bmp->width; x++) {
+            for (unsigned int x = 0; x < bmp->width; x++) {
                 unsigned char a = src[x];
                 if (a == 0)
                     continue;
@@ -795,6 +796,7 @@ static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
     glyph_bitmap->x_offset = slot->bitmap_left;
     glyph_bitmap->y_offset = slot->bitmap_top;
     glyph_bitmap->advance = (int)(slot->advance.x >> 6); // Convert from 26.6 fixed point
+    glyph_bitmap->glyph_id = glyph_index;
 
     // Handle zero-width or zero-height glyphs (e.g., spaces)
     if (glyph_bitmap->width <= 0 || glyph_bitmap->height <= 0) {
@@ -986,6 +988,7 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
     glyph_bitmap->x_offset = slot->bitmap_left;
     glyph_bitmap->y_offset = slot->bitmap_top;
     glyph_bitmap->advance = (int)(slot->advance.x >> 6);
+    glyph_bitmap->glyph_id = glyph_index;
 
     if (glyph_bitmap->width <= 0 || glyph_bitmap->height <= 0) {
         glyph_bitmap->pixels = NULL;
