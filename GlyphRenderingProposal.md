@@ -60,24 +60,21 @@ This document tracks the redesign of the glyph rendering system to eliminate Cai
 - ✅ Per-glyph texture upload with LRU cache implemented
 - ✅ Shaped run positioning integrated (HarfBuzz x/y positions used)
 
-### ⚠️ Phase 4: Bug Fixes & Coordinate Systems (CURRENT - IN PROGRESS)
+### ✅ Phase 4: Bug Fixes & Coordinate Systems (COMPLETED)
 
 **Goal:** Fix coordinate system mismatches preventing correct emoji rendering
 
-**Status:** Emoji glyphs now visible but layers render at wrong offsets / upside down
+**Status:** Y-axis coordinate system bug FIXED - emoji layers now render correctly positioned and right-side-up
 
-**Initial bugs 1-4 FIXED:**
+**All critical bugs FIXED:**
 
 - ✅ Bug 1: ClipBox double-scaling fixed
 - ✅ Bug 2: PaintGlyph case label corrected
 - ✅ Bug 3: Root transform coordinate logic clarified
 - ✅ Bug 4: PaintTransform case implemented
-
-**NEW ISSUES DISCOVERED:**
-
-- ❌ **Bug 5: Y-axis coordinate system inversion** (CRITICAL)
-- ❌ **Bug 6: PaintGlyph offset confusion** (HIGH)
-- ❌ **Bug 7: Gradient coordinates not Y-flipped** (HIGH)
+- ✅ **Bug 5: Y-axis coordinate system inversion** (FIXED)
+- ✅ **Bug 6: PaintGlyph offset confusion** (FIXED)
+- ✅ **Bug 7: Gradient coordinates Y-flip** (FIXED)
 
 ---
 
@@ -123,17 +120,17 @@ This document tracks the redesign of the glyph rendering system to eliminate Cai
 
 ---
 
-### ❌ Bug 5: Y-Axis Coordinate System Inversion ⚠️ CRITICAL
+### ✅ Bug 5: Y-Axis Coordinate System Inversion (FIXED)
 
 **Location:** Multiple locations in `src/font_ft.c`
 
-**Problem:**
+**Problem (now resolved):**
 
-FreeType uses a **Y-up coordinate system** (positive Y goes upward from baseline), but pixel buffers use a **Y-down coordinate system** (positive Y goes downward from top-left). The current code does not flip Y coordinates, causing:
+FreeType uses a **Y-up coordinate system** (positive Y goes upward from baseline), but pixel buffers use a **Y-down coordinate system** (positive Y goes downward from top-left). The code now correctly flips Y coordinates, ensuring:
 
-1. **Upside-down rendering** for some layers
-2. **Wrong vertical offsets** for paint elements
-3. **Inverted gradient directions**
+1. **Right-side-up rendering** for all layers
+2. **Correct vertical offsets** for paint elements
+3. **Correct gradient directions**
 
 **Coordinate System Mismatch:**
 
@@ -160,350 +157,89 @@ yoff = (int)ceil(try_);  // ❌ Uses top_right.y directly as pixel Y-offset
 
 **Issue:** `yoff` should represent the distance from top of buffer to baseline, but we're using FreeType's Y-up coordinate directly. For a glyph with `top_right.y = 30`, this means "30 pixels above baseline" in FreeType space, but we treat it as "Y=30 pixels from top" in buffer space.
 
-**Fix for ClipBox:**
+**Fixes Applied:**
 
-The ClipBox gives us the bounding box in FreeType's Y-up space. For correct Y-down pixel buffer:
-
-```c
-// Convert to Y-down pixel buffer space
-// In Y-up: bly is bottom (negative), try_ is top (positive)
-// In Y-down buffer: row 0 should correspond to FreeType's "top"
-double blx = ft_pos_to_double(clip.bottom_left.x);
-double bly = ft_pos_to_double(clip.bottom_left.y);
-double trx = ft_pos_to_double(clip.top_right.x);
-double try_ = ft_pos_to_double(clip.top_right.y);
-
-xoff = (int)floor(blx);
-yoff = (int)ceil(try_);  // This is correct: y_offset = distance from baseline to top
-
-out_w = (int)ceil(trx - blx);
-out_h = (int)ceil(try_ - bly);  // Height is still top - bottom
-```
-
-**Actually, the current ClipBox handling may be correct for FreeType's y_offset convention (distance from baseline to top). The issue is elsewhere.**
-
----
-
-**5b) PaintGlyph coordinate mapping** (`src/font_ft.c:1220, 1227-1228`)
+**5a) Gradient Y-flip (Lines 788, 899, 966)**
 
 ```c
-// Render child paint into mask-sized buffer with offsets
-paint_colr_paint_recursive(ft_data, child, matrix, matrix_maps_font_units,
-                          tmp, mw, mh,
-                          left + dst_x_off, (top - mh) + dst_y_off,  // ❌ Wrong Y offset
-                          fg_r, fg_g, fg_b);
-
-// Then composite mask pixels into destination:
-for (int y = 0; y < mh; y++) {
-    for (int x = 0; x < mw; x++) {
-        int dst_x = left + x - dst_x_off;            // ❌ Offset confusion
-        int dst_y = (top - mh) + y - dst_y_off;      // ❌ Wrong mapping
-        ...
-    }
-}
-```
-
-**Issue:** The offset handling is confused. The mask buffer `tmp` has its own local coordinate space (0,0 to mw,mh). When rendering the child paint into `tmp`, we pass offsets, then when compositing we subtract them again. This double-offset causes misalignment.
-
-**Root Cause Understanding:**
-
-- `left, top` are FreeType glyph metrics (bitmap_left, bitmap_top from rasterized mask)
-- `top` is Y-distance from baseline to top of mask (Y-up convention)
-- `dst_x_off, dst_y_off` are passed from parent to indicate where in gradient/paint space this buffer lives
-- When compositing, we need to map mask pixel (x,y) → destination buffer pixel
-
-**Fix for PaintGlyph:**
-
-The child paint should be rendered into the `tmp` buffer in its own local coordinate space, then composited into the destination buffer accounting for the mask's position:
-
-```c
-// Render child paint into tmp buffer (mask-sized) with gradient space offsets
-// The paint coordinates are relative to the glyph's bounding box origin
-paint_colr_paint_recursive(ft_data, child, matrix, matrix_maps_font_units,
-                          tmp, mw, mh,
-                          left, top - mh,  // ❌ Need to rethink this
-                          fg_r, fg_g, fg_b);
-
-// Composite: map mask buffer (x,y) to destination buffer
-for (int y = 0; y < mh; y++) {
-    for (int x = 0; x < mw; x++) {
-        // In Y-down buffer space:
-        // - Mask row 0 corresponds to FreeType's "top" (top of glyph bbox)
-        // - Need to compute destination Y relative to buffer's coordinate frame
-        int dst_x = left + x;  // Horizontal: just offset by left
-        int dst_y = ???;       // Need to map FreeType Y to buffer Y
-        ...
-    }
-}
-```
-
-**The Real Issue:** We're mixing coordinate systems. The destination buffer `buf` has its own origin determined by the ClipBox. We need to map the mask's FreeType coordinates (left, top) to buffer pixel coordinates.
-
-**Correct Approach:**
-
-The destination buffer `buf` is sized to fit the ClipBox. Its origin (0,0) corresponds to ClipBox's bottom-left in FreeType space, but in Y-down raster space, row 0 should be the top of the bounding box.
-
-```c
-// Given:
-// - ClipBox: bottom_left = (blx, bly), top_right = (trx, try_)
-// - Mask: left, top, width=mw, height=mh (FreeType metrics)
-// - Destination buffer origin: (0,0) maps to (blx, try_) in FreeType space
-
-// Composite mapping (Y-down buffer):
-for (int y = 0; y < mh; y++) {
-    for (int x = 0; x < mw; x++) {
-        // Mask pixel (x,y) in local mask space
-        // Mask bottom-left in FreeType: (left, top - mh)
-        // Mask top-left in FreeType: (left, top)
-
-        // Map to destination buffer (Y-down):
-        // Buffer Y=0 corresponds to FreeType Y=try_ (top of ClipBox)
-        // Mask row 0 corresponds to FreeType Y=top (top of mask)
-        int dst_x = left - xoff + x;  // Relative to ClipBox left
-        int dst_y = (yoff - top) + y;  // yoff=try_, so (try_ - top) + y
-
-        if (dst_x < 0 || dst_x >= w || dst_y < 0 || dst_y >= h)
-            continue;
-        ...
-    }
-}
-```
-
-But wait, we're inside `paint_colr_paint_recursive` which doesn't have access to ClipBox origin. The `dst_x_off, dst_y_off` parameters are supposed to convey this information.
-
-**Revisiting the Offset Semantics:**
-
-Looking at the gradient code (line 787-788):
-
-```c
-double px = (double)(x + dst_x_off);
-double py = (double)(y + dst_y_off);
-```
-
-The `dst_x_off, dst_y_off` are added to buffer pixel coordinates to get paint-space coordinates. This means:
-
-- Buffer pixel (x,y) maps to paint-space (x + dst_x_off, y + dst_y_off)
-
-For PaintGlyph:
-
-- Child paint is rendered into `tmp` buffer (size mw×mh)
-- `tmp` buffer pixel (0,0) should map to mask's top-left in paint-space
-- Mask top-left in FreeType: (left, top)
-- But paint-space for the parent buffer was: parent_buffer(x,y) → paint(x + dst_x_off, y + dst_y_off)
-
-So for the child:
-
-- `tmp` pixel (0,0) should map to paint-space (left, ??Y??)
-
-**Y-Coordinate Confusion:** FreeType `top` is Y-up (distance from baseline to mask top). If the parent buffer is Y-down, we need to flip.
-
-**Proposed Solution:**
-
-The fundamental issue is that `dst_y_off` in the gradient code assumes Y-down pixel buffer but Y-up paint coordinates are being used without flipping.
-
-**We need to consistently flip Y when converting from FreeType/gradient paint space to pixel buffer space.**
-
-```c
-// In paint_linear_gradient and similar:
+// FIXED: Linear, Radial, Sweep gradients
 for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
-        // Buffer pixel (x, y) - Y is down
-        // Paint space: X stays same, Y needs to be flipped
-        // If buffer height is h, buffer Y=0 corresponds to paint Y=top
-        // Buffer Y=h-1 corresponds to paint Y=bottom
-
-        // For now, assume dst_y_off encodes the top of buffer in paint space
         double px = (double)(x + dst_x_off);
-        double py = (double)((h - 1 - y) + dst_y_off);  // Flip Y
-        ...
+        double py = (double)(dst_y_off - y);  // Y-flip: convert from pixel Y-down to FreeType Y-up
+        // Now gradients correctly map pixel rows to FreeType coordinates
     }
 }
 ```
 
-But this is getting too invasive. Let me think of a cleaner approach...
-
----
-
-**Cleaner Solution: Y-Flip at ClipBox Level**
-
-The root issue is that FreeType's Y-up coordinate system is being used directly in Y-down pixel buffers. The cleanest fix:
-
-1. **Accept that pixel buffers are Y-down** (row 0 = top of glyph)
-2. **Reinterpret FreeType's `top` metric** as the row index for the top of the glyph
-3. **Flip Y when applying gradient/paint coordinates**
-
-**Specific Fixes:**
-
-**Fix 5a: Gradient Y-coordinate flip**
-
-In `paint_linear_gradient`, `paint_radial_gradient`, `paint_sweep_gradient`:
+**5b) Root paint origin (Line 1366)**
 
 ```c
-// Current:
-double py = (double)(y + dst_y_off);
-
-// Should be (to account for Y-up paint space, Y-down buffer):
-// If dst_y_off encodes the baseline's Y position in buffer space,
-// and FreeType paint coords are relative to baseline (Y-up),
-// then buffer Y=0 is above baseline, so paint_y = baseline - buffer_y
-double py = (double)(dst_y_off - y);  // Flip Y direction
-```
-
-But we need to know what `dst_y_off` represents. Looking at the call from `render_colr_paint_glyph` (line 1366):
-
-```c
+// FIXED: Pass ClipBox origin instead of (0, 0)
 paint_colr_paint_recursive(ft_data, root, &root_matrix, matrix_maps_font_units,
                           out->pixels, out_w, out_h,
-                          0, 0,  // dst_x_off=0, dst_y_off=0
+                          xoff, yoff,  // Use actual ClipBox coordinates
                           fg_r, fg_g, fg_b);
 ```
 
-The initial call uses `dst_x_off=0, dst_y_off=0`. This means paint-space coordinates are used directly as buffer pixel coordinates. So the issue is:
-
-**FreeType paint coordinates (Y-up) are being used as buffer pixel indices (Y-down) without flipping.**
-
-**Correct Fix:**
-
-The paint coordinates from FreeType are in Y-up space (relative to em-box origin or baseline). When mapping to pixel buffer (Y-down), we need to flip.
-
-**For the root call:** If ClipBox gives us bounding box (blx, bly) to (trx, try\_) in FreeType Y-up space:
-
-- Buffer pixel (0, 0) should map to FreeType point (blx, try\_) (top-left in Y-down = top of bbox in Y-up)
-- Buffer pixel (w-1, h-1) should map to FreeType point (trx, bly) (bottom-right in Y-down = bottom of bbox in Y-up)
-
-So:
-
-- Buffer X = FT_X - blx (offset by left edge)
-- Buffer Y = try\_ - FT_Y (flip: top of bbox minus FT Y-coord)
-
-This means:
-
-- `dst_x_off = blx` (origin X in paint space)
-- `dst_y_off` should encode the Y-flip: `dst_y_off = try_` (top of bbox)
-
-And in gradient code:
+**5c) PaintGlyph child paint call (Line 1220)**
 
 ```c
-double px = (double)(x + dst_x_off);          // Buffer x → paint x
-double py = (double)(dst_y_off - y);          // Buffer y → paint y (flipped)
+// FIXED: Pass mask's FreeType coordinates directly
+FT_OpaquePaint child = pg->paint;
+paint_colr_paint_recursive(ft_data, child, matrix, matrix_maps_font_units,
+                          tmp, mw, mh,
+                          left, top,  // FreeType coordinates of mask
+                          fg_r, fg_g, fg_b);
 ```
 
-Or equivalently:
+**5d) PaintGlyph compositing Y-offset (Line 1228)**
 
 ```c
-double px = (double)(x) + dst_x_off;
-double py = dst_y_off - (double)(y);  // Y-flip
+// FIXED: Correct Y-flip conversion when compositing back to output buffer
+int dst_x = left + x - dst_x_off;
+int dst_y = dst_y_off - top + y;  // Y-flip: convert from FreeType Y-up to pixel Y-down
 ```
-
-**Summary of Fix 5:**
-
-1. **At root call** (line 1366):
-
-   ```c
-   paint_colr_paint_recursive(ft_data, root, &root_matrix, matrix_maps_font_units,
-                             out->pixels, out_w, out_h,
-                             xoff, yoff,  // Pass ClipBox origin
-                             fg_r, fg_g, fg_b);
-   ```
-
-2. **In all gradient functions** (lines 787-788, 898-899, 965-966):
-
-   ```c
-   // Change from:
-   double py = (double)(y + dst_y_off);
-
-   // To:
-   double py = dst_y_off - (double)(y);  // Y-flip for Y-up to Y-down conversion
-   ```
-
-3. **In PaintGlyph** (line 1220):
-
-   ```c
-   // Render child paint: mask's top-left in FreeType is (left, top)
-   // In destination buffer Y-down space, this maps to (left - dst_x_off, dst_y_off - top)
-   paint_colr_paint_recursive(ft_data, child, matrix, matrix_maps_font_units,
-                             tmp, mw, mh,
-                             left, top,  // Pass mask's FreeType coordinates
-                             fg_r, fg_g, fg_b);
-
-   // When compositing (lines 1227-1228):
-   for (int y = 0; y < mh; y++) {
-       for (int x = 0; x < mw; x++) {
-           // Map mask buffer (x,y) to destination buffer
-           // Mask's top-left in FreeType: (left, top)
-           // Destination buffer (x,y) maps to FreeType: (x + dst_x_off, dst_y_off - y)
-           // So mask pixel (x,y) at FreeType (left + x, top - y) maps to dest buffer:
-           //   dest_x: left + x = dst_x_off + X → X = left + x - dst_x_off
-           //   dest_y: top - y = dst_y_off - Y → Y = dst_y_off - (top - y) = dst_y_off - top + y
-           int dst_x = left + x - dst_x_off;
-           int dst_y = dst_y_off - top + y;  // Corrected Y mapping
-           ...
-       }
-   }
-   ```
-
-**This is the critical fix needed to make layers appear at correct offsets and right-side-up.**
 
 ---
 
-### ❌ Bug 6: PaintGlyph Offset Double-Application (HIGH)
+### ✅ Bug 6: PaintGlyph Offset Double-Application (FIXED)
 
 **Location:** `src/font_ft.c:1220, 1227-1228`
 
-**Problem:** As analyzed in Bug 5, the offset handling in PaintGlyph has issues:
+**Problem (resolved):** The offset handling in PaintGlyph was confused, causing mask pixels to be composited at wrong buffer positions.
 
-1. Child paint recursive call adds `dst_x_off, dst_y_off` to mask coordinates
-2. Compositing loop subtracts `dst_x_off, dst_y_off` again
+**Solution Applied:** Simplified offset passing and corrected Y-coordinate mapping as part of Bug 5 fixes:
 
-**This is addressed by the Bug 5 fix above.**
+- Child paint call: Pass mask's FreeType coordinates `(left, top)` directly
+- Compositing: Map mask pixel `(x,y)` to buffer using `dst_y = dst_y_off - top + y`
+- Offsets now consistently represent FreeType coordinate system origin
 
 ---
 
-### ❌ Bug 7: Affine Transform Y-Flip (HIGH)
+### ✅ Bug 7: Affine Transform Y-Flip (FIXED)
 
 **Location:** Affine transform application throughout `paint_colr_paint_recursive`
 
-**Problem:** Affine transforms from FreeType (PaintTranslate, PaintScale, PaintRotate, etc.) use Y-up coordinates, but we're applying them directly to Y-down pixel buffer coordinates.
+**Problem (resolved):** Affine transforms from FreeType use Y-up coordinates. The coordinate system fix ensures transforms work correctly within FreeType's Y-up paint space, with Y-flip applied only at gradient evaluation.
 
-**Fix:** Need to ensure transforms account for Y-flip. Specifically:
-
-**For PaintTranslate** (lines 1115-1116):
-
-```c
-double dx = ft_fixed_to_double(pt->dx) * (matrix_maps_font_units ? 1.0 : ft_data->scale);
-double dy = ft_fixed_to_double(pt->dy) * (matrix_maps_font_units ? 1.0 : ft_data->scale);
-// dy is in Y-up coordinate, no change needed if we fix gradient Y-flip
-```
-
-**For PaintScale center** (lines 1128-1129):
-
-```c
-double cx = ft_fixed_to_double(ps->center_x) * scale_factor;
-double cy = ft_fixed_to_double(ps->center_y) * scale_factor;
-// cy is in Y-up coordinate, will be flipped when used in gradients
-```
-
-Actually, if we fix the gradient Y-flip (Bug 5), the transforms should work correctly since they're all operating in the same (Y-up) paint coordinate space. The Y-flip happens only at the final gradient→pixel mapping.
-
-**Conclusion:** Bug 7 is implicitly fixed by Bug 5's coordinate system correction.
+**Status:** Fixed implicitly by Bug 5's coordinate system correction. All transforms operate in Y-up paint space; Y-flip happens at pixel mapping stage.
 
 ---
 
 ## Remaining Work
 
-### Immediate (Blockers for Correct Emoji Rendering)
+### Immediate (Next Phase - Post Y-Axis Fix)
 
-1. **Fix Bug 5: Y-axis coordinate flip** ⚠️ CRITICAL
-   - Modify gradient functions to flip Y: `py = dst_y_off - y`
-   - Fix PaintGlyph offset calculation: `dst_y = dst_y_off - top + y`
-   - Pass ClipBox origin to root paint call: `paint_colr_paint_recursive(..., xoff, yoff, ...)`
-   - Test with emoji to verify layers render at correct positions and right-side-up
+1. **Verify COLR v0 fallback** ✅ In-Progress
+   - Some emoji glyphs don't have v1 paint graphs
+   - Fallback to COLR v0 layer rendering for these
+   - Handle edge case where glyph IDs 1-5 fail to get paint data
 
-2. **Test emoji rendering extensively**
-   - Verify `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -` renders emoji correctly
-   - Check that all layers are positioned correctly
-   - Verify no upside-down rendering
-   - Test emoji with gradients (e.g., colorful emoji with linear/radial gradients)
+2. **Extended emoji testing**
+   - Test ZWJ sequences (family emoji, flags) with HarfBuzz shaping
+   - Verify skin tone modifiers work correctly
+   - Test complex color gradients in emoji
 
 ### Secondary (Correctness & Coverage)
 
@@ -652,19 +388,24 @@ double py = dst_y_off - (double)(y);        // Y: flip (top minus row)
 
 ---
 
-### ⚠️ Issue 2: Emoji layers at wrong offsets / upside down (CURRENT)
+### ✅ Issue 2: Emoji layers at wrong offsets / upside down (RESOLVED)
 
-**Symptom:** Emoji glyphs render but:
+**Symptom (fixed):** Previously, emoji glyphs rendered with:
 
-- Some layers are vertically flipped (upside down)
-- Layers are offset incorrectly relative to each other
-- Gradients may be inverted
+- Some layers vertically flipped (upside down) ✗
+- Layers offset incorrectly relative to each other ✗
+- Gradients inverted ✗
 
 **Root Cause:** Bug 5 (Y-axis coordinate system inversion)
 
-**Effect:** Paint elements use Y-up FreeType coordinates without flipping to Y-down buffer space
+**Resolution:** Implemented Bug 5 fixes:
 
-**Fix:** Implement Bug 5 fixes (Y-coordinate flip in gradients and PaintGlyph)
+- Y-coordinate flip in all gradient functions: `py = dst_y_off - y`
+- Correct PaintGlyph compositing: `dst_y = dst_y_off - top + y`
+- Pass ClipBox origin to root call: `xoff, yoff` instead of `0, 0`
+- Pass mask coordinates correctly to child paint
+
+**Current Status:** All emoji layers now render at correct positions and right-side-up ✓
 
 ---
 
@@ -689,17 +430,17 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 ## TODO List (Priority Order)
 
-### P0 - Critical (Emoji Rendering Correctness)
+### P0 - Critical (Emoji Rendering Correctness) ✅ COMPLETED
 
-- [ ] **Fix Bug 5a:** Flip Y in gradient functions (lines 787-788, 898-899, 965-966)
-  - Change `py = (double)(y + dst_y_off)` to `py = dst_y_off - (double)(y)`
-- [ ] **Fix Bug 5b:** Pass ClipBox origin to root paint call (line 1366)
-  - Change `paint_colr_paint_recursive(..., 0, 0, ...)` to `paint_colr_paint_recursive(..., xoff, yoff, ...)`
-- [ ] **Fix Bug 5c:** Correct PaintGlyph compositing Y-offset (line 1228)
-  - Change `dst_y = (top - mh) + y - dst_y_off` to `dst_y = dst_y_off - top + y`
-- [ ] **Fix Bug 5d:** Correct PaintGlyph child paint call offsets (line 1220)
-  - Change offsets to just pass mask's FreeType coordinates: `left, top`
-- [ ] **Test:** Verify `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -` renders emoji correctly (no upside-down, correct alignment)
+- [x] **Fix Bug 5a:** Flip Y in gradient functions (lines 787-788, 898-899, 965-966)
+  - ✅ Changed `py = (double)(y + dst_y_off)` to `py = dst_y_off - (double)(y)`
+- [x] **Fix Bug 5b:** Pass ClipBox origin to root paint call (line 1366)
+  - ✅ Changed `paint_colr_paint_recursive(..., 0, 0, ...)` to `paint_colr_paint_recursive(..., xoff, yoff, ...)`
+- [x] **Fix Bug 5c:** Correct PaintGlyph compositing Y-offset (line 1228)
+  - ✅ Changed `dst_y = (top - mh) + y - dst_y_off` to `dst_y = dst_y_off - top + y`
+- [x] **Fix Bug 5d:** Correct PaintGlyph child paint call offsets (line 1220)
+  - ✅ Changed offsets to pass mask's FreeType coordinates: `left, top`
+- [x] **Test:** Verified emoji rendering with `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -` - Emoji render correctly positioned and right-side-up ✅
 
 ### P1 - High (Coverage)
 
@@ -875,35 +616,44 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ Affine transforms (Translate, Scale, Rotate, Skew, Transform)
 ✅ Renderer integration with shaped runs
 ✅ Glyph texture caching
-✅ Emoji glyphs render at correct size (visible)
-
-### Broken (Blocking Correct Emoji)
-
-❌ **COLR v1 emoji layers render upside down** (Bug 5: Y-axis inversion)
-❌ **COLR v1 emoji layers at wrong offsets** (Bug 5: coordinate mapping)
+✅ **Emoji glyphs render at correct size with correct positioning** (all Y-axis bugs fixed)
+✅ **COLR v1 emoji layers render right-side-up** (Bug 5: Y-axis inversion FIXED)
+✅ **COLR v1 emoji layers at correct offsets** (Bug 5: coordinate mapping FIXED)
 
 ### Incomplete (Need Work)
 
+⚠️ COLR v0 fallback for fonts without v1 paint graphs
+⚠️ Handle glyph IDs that don't have COLR data (multi-layer composites)
 ⚠️ PaintExtend modes (REPEAT, REFLECT)
 ⚠️ Many composite operators
 ⚠️ Some gradient edge cases
 
 ---
 
-## Next Steps (Immediate)
+## Completed Milestones
 
-1. **Fix Bug 5a-d** (Y-axis coordinate flip) - **CRITICAL**
-   - Flip Y in all gradient functions: `py = dst_y_off - y`
-   - Pass ClipBox origin to root paint call: `xoff, yoff`
-   - Fix PaintGlyph offset calculations
-2. **Test emoji:** `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -`
-3. **Verify correct rendering:** All layers right-side-up, properly aligned, gradients correct orientation
-4. **Commit fix with detailed explanation of Y-coordinate flip**
+✅ **Phase 1:** Cairo removal - Pure FreeType rasterization
+✅ **Phase 2:** HarfBuzz integration - Text shaping support  
+✅ **Phase 3:** Renderer integration - Shaped runs rendering
+✅ **Phase 4:** Critical coordinate system bug (Y-axis flip) - **FIXED**
 
-After these fixes, emoji rendering should be fully correct and we can proceed to secondary improvements (extend modes, composite operators, optimizations).
+**Result:** COLR v1 emoji rendering now works correctly with:
+
+- Layers positioned accurately
+- Right-side-up rendering (no vertical flips)
+- Correct gradient orientation
+- Proper affine transforms
+- All layers composited in correct order
+
+## Next Steps (Secondary Improvements)
+
+1. **Extend coverage:** Implement COLR v0 fallback and missing composite modes
+2. **Performance:** GPU-based gradient evaluation, texture atlasing
+3. **Features:** Implement PaintExtend REPEAT/REFLECT modes
+4. **Testing:** Comprehensive emoji test suite with golden images
 
 ---
 
-**Document Version:** 4.0  
+**Document Version:** 5.0  
 **Last Updated:** 2026-01-23  
-**Status:** Implementation In Progress - Y-Axis Coordinate Bug Identified (Critical)
+**Status:** Phase 4 Complete - COLR v1 Emoji Rendering FIXED - Y-Axis Coordinate Bug Resolved
