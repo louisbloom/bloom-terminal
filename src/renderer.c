@@ -458,7 +458,8 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                     }
                 }
 
-                vlog("  Selected font: %s (style=%d)\n", font_type, style);
+                bool selected_has_colr = font_style_has_colr(rend->font, style);
+                vlog("  Selected font: %s (style=%d) has_colr=%d\n", font_type, style, selected_has_colr);
 
                 // If multiple codepoints, try shaped rendering (backend must support it)
                 if (cp_count > 1 && rend->font && rend->font->render_shaped) {

@@ -241,6 +241,7 @@ int font_resolver_find_font(FontType type, FontResolutionResult *result)
 
     result->font_path = font_path;
     result->family_name = family_name;
+    vlog("font_resolver_find_font: resolved type=%d to path='%s' family='%s'\n", type, result->font_path, result->family_name ? result->family_name : "(null)");
     return 0;
 }
 

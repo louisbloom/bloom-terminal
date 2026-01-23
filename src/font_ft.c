@@ -1255,6 +1255,7 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
     }
     default:
         // Unsupported paint types fall back to solid transparent
+        vlog("Unsupported FT_COLR paint format: %d\n", paint.format);
         for (int i = 0; i < w * h; i++) {
             buf[i * 4 + 0] = 0;
             buf[i * 4 + 1] = 0;
@@ -1273,13 +1274,21 @@ static GlyphBitmap *render_colr_paint_glyph(FtFontData *ft_data, FT_UInt glyph_i
         return NULL;
 
     FT_OpaquePaint root = { NULL, 0 };
-    if (!FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index, FT_COLOR_INCLUDE_ROOT_TRANSFORM, &root))
-        return NULL;
+    int got = FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index, FT_COLOR_INCLUDE_ROOT_TRANSFORM, &root);
+    if (!got) {
+        vlog("FT_Get_Color_Glyph_Paint with INCLUDE_ROOT_TRANSFORM failed for glyph %u, trying NO_ROOT_TRANSFORM\n", glyph_index);
+        if (!FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index, FT_COLOR_NO_ROOT_TRANSFORM, &root)) {
+            vlog("FT_Get_Color_Glyph_Paint failed for glyph %u (both INCLUDE_ROOT_TRANSFORM and NO_ROOT_TRANSFORM)\n", glyph_index);
+            return NULL;
+        }
+    }
 
     // Get root paint
     FT_COLR_Paint root_paint;
-    if (!FT_Get_Paint(ft_data->ft_face, root, &root_paint))
+    if (!FT_Get_Paint(ft_data->ft_face, root, &root_paint)) {
+        vlog("FT_Get_Paint failed for glyph %u\n", glyph_index);
         return NULL;
+    }
 
     // Determine bounding box for glyph using FT_Get_Color_Glyph_ClipBox if available
     FT_ClipBox clip;
@@ -1554,11 +1563,20 @@ static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
 
     FT_Face face = ft_data->ft_face;
 
-    // Load the glyph
+    // Load the glyph index for this codepoint
     FT_UInt glyph_index = FT_Get_Char_Index(face, codepoint);
     if (glyph_index == 0) {
         vlog("No glyph index found for U+%04X\n", codepoint);
         return NULL;
+    }
+
+    // If this is a COLR face, try the COLR paint/layer render path first (rasterize_glyph_index implements this)
+    if (ft_data->has_colr && FT_HAS_COLOR(face)) {
+        GlyphBitmap *colr_gb = rasterize_glyph_index(ft_data, glyph_index, fg_r, fg_g, fg_b);
+        if (colr_gb)
+            return colr_gb;
+        // If COLR render failed, continue to attempt grayscale/outlines below
+        vlog("COLR render path failed for U+%04X, falling back to outline/grayscale rendering\n", codepoint);
     }
 
     // Load glyph with appropriate flags
@@ -1591,77 +1609,6 @@ static GlyphBitmap *ft_render_glyph(Font *font, void *font_data,
     if (error) {
         vlog("Failed to load glyph for U+%04X: error %d\n", codepoint, error);
         return NULL;
-    }
-
-    // Handle COLR fonts differently (attempt grayscale fallback for now)
-    if (ft_data->has_colr) {
-        vlog("COLR font detected for U+%04X; using grayscale fallback (color glyphs not yet implemented)\n", codepoint);
-        // Attempt to render a grayscale fallback for COLR glyphs
-        FT_Error fallback_err = FT_Render_Glyph(face->glyph, ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO);
-        if (fallback_err) {
-            vlog("Failed to render grayscale fallback for COLR glyph U+%04X: error %d\n", codepoint, fallback_err);
-            return NULL;
-        }
-
-        FT_GlyphSlot slot2 = face->glyph;
-        FT_Bitmap *bitmap2 = &slot2->bitmap;
-
-        GlyphBitmap *glyph_bitmap_fallback = malloc(sizeof(GlyphBitmap));
-        if (!glyph_bitmap_fallback) {
-            return NULL;
-        }
-
-        glyph_bitmap_fallback->width = bitmap2->width;
-        glyph_bitmap_fallback->height = bitmap2->rows;
-        glyph_bitmap_fallback->x_offset = slot2->bitmap_left;
-        glyph_bitmap_fallback->y_offset = slot2->bitmap_top;
-        glyph_bitmap_fallback->advance = (int)(slot2->advance.x >> 6);
-
-        if (glyph_bitmap_fallback->width <= 0 || glyph_bitmap_fallback->height <= 0) {
-            glyph_bitmap_fallback->pixels = NULL;
-            return glyph_bitmap_fallback;
-        }
-
-        glyph_bitmap_fallback->pixels = malloc(glyph_bitmap_fallback->width * glyph_bitmap_fallback->height * 4);
-        if (!glyph_bitmap_fallback->pixels) {
-            free(glyph_bitmap_fallback);
-            return NULL;
-        }
-
-        if (bitmap2->pixel_mode == FT_PIXEL_MODE_GRAY) {
-            for (int y = 0; y < (int)bitmap2->rows; y++) {
-                unsigned char *src_row = bitmap2->buffer + y * bitmap2->pitch;
-                unsigned char *dst_row = glyph_bitmap_fallback->pixels + y * glyph_bitmap_fallback->width * 4;
-                for (int x = 0; x < (int)bitmap2->width; x++) {
-                    unsigned char alpha = src_row[x];
-                    dst_row[x * 4 + 0] = fg_r;
-                    dst_row[x * 4 + 1] = fg_g;
-                    dst_row[x * 4 + 2] = fg_b;
-                    dst_row[x * 4 + 3] = alpha;
-                }
-            }
-        } else if (bitmap2->pixel_mode == FT_PIXEL_MODE_MONO) {
-            for (int y = 0; y < (int)bitmap2->rows; y++) {
-                unsigned char *src_row = bitmap2->buffer + y * bitmap2->pitch;
-                unsigned char *dst_row = glyph_bitmap_fallback->pixels + y * glyph_bitmap_fallback->width * 4;
-                for (int x = 0; x < (int)bitmap2->width; x++) {
-                    unsigned char byte = src_row[x >> 3];
-                    unsigned char bit = (byte >> (7 - (x & 7))) & 1;
-                    unsigned char alpha = bit ? 255 : 0;
-                    dst_row[x * 4 + 0] = fg_r;
-                    dst_row[x * 4 + 1] = fg_g;
-                    dst_row[x * 4 + 2] = fg_b;
-                    dst_row[x * 4 + 3] = alpha;
-                }
-            }
-        } else {
-            free(glyph_bitmap_fallback->pixels);
-            free(glyph_bitmap_fallback);
-            return NULL;
-        }
-
-        vlog("Rendered grayscale fallback for COLR glyph U+%04X: %dx%d\n", codepoint, glyph_bitmap_fallback->width, glyph_bitmap_fallback->height);
-        return glyph_bitmap_fallback;
     }
 
     // Render the glyph to a bitmap
@@ -1822,12 +1769,16 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
     if (ft_data->has_colr && FT_HAS_COLOR(ft_data->ft_face)) {
         // Try COLR v1 paint graph rendering first
         GlyphBitmap *colr_p = render_colr_paint_glyph(ft_data, glyph_index, fg_r, fg_g, fg_b);
-        if (colr_p)
+        if (colr_p) {
+            vlog("rasterize_glyph_index: COLR v1 paint rendered for glyph %u: %dx%d\n", glyph_index, colr_p->width, colr_p->height);
             return colr_p;
+        }
         // Fallback to COLR v0 layer rendering
         GlyphBitmap *colr = render_colr_glyph(ft_data, glyph_index, fg_r, fg_g, fg_b);
-        if (colr)
+        if (colr) {
+            vlog("rasterize_glyph_index: COLR v0 layers rendered for glyph %u: %dx%d\n", glyph_index, colr->width, colr->height);
             return colr;
+        }
         // Otherwise fall back to grayscale rasterization below
     }
 
@@ -2165,6 +2116,15 @@ static bool ft_get_glyph_info(Font *font, void *font_data, uint32_t codepoint,
 }
 
 // FreeType font implementation
+static bool ft_style_has_colr(Font *font, void *font_data)
+{
+    (void)font;
+    FtFontData *ft_data = (FtFontData *)font_data;
+    if (!ft_data)
+        return false;
+    return ft_data->has_colr;
+}
+
 Font font = {
     .name = "freetype",
     .init = font_init,
@@ -2180,5 +2140,6 @@ Font font = {
     .free_glyph_bitmap = ft_free_glyph_bitmap,
     .load_font = font_load_font,
     .get_style_metrics = font_get_metrics,
-    .has_style = font_has_style
+    .has_style = font_has_style,
+    .style_has_colr = ft_style_has_colr
 };

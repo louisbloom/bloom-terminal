@@ -125,6 +125,9 @@ struct Font
 
     // Check if a style is loaded
     bool (*has_style)(Font *font, FontStyle style);
+
+    // Check if a loaded style supports COLR (color glyphs)
+    bool (*style_has_colr)(Font *font, void *font_data);
 };
 
 // Font font API
@@ -151,6 +154,9 @@ bool font_set_variation_axes(Font *font, FontStyle style,
                              float *coords, int num_coords);
 
 bool font_has_style(Font *font, FontStyle style);
+
+// NEW: Check if a loaded style supports COLR (color glyphs)
+bool font_style_has_colr(Font *font, FontStyle style);
 
 // Extern declaration for the FreeType backend implementation
 extern Font font;

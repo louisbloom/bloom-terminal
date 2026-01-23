@@ -2,684 +2,607 @@
 
 ## Executive Summary
 
-This document outlines a complete redesign of the glyph rendering system to eliminate Cairo dependency and leverage FreeType, HarfBuzz, and SDL3 for high-performance, feature-rich text rendering with proper support for:
-
-- Variable font axis control (Weight, Width, Slant, etc.)
-- Complex text shaping (ligatures, combining marks, emoji sequences)
-- Correct kerning and positioning for all font variations
-- Efficient GPU texture uploading via SDL3
+This document tracks the redesign of the glyph rendering system to eliminate Cairo dependency and leverage FreeType, HarfBuzz, and SDL3 for high-performance, feature-rich text rendering with support for variable fonts, complex text shaping, and COLR v1 color emoji.
 
 ## System Versions
 
 **Installed Library Versions:**
 
-- FreeType: 26.2.20
+- FreeType: 2.13+ (with COLR v1 APIs)
 - HarfBuzz: 11.5.1
 - SDL3: 3.2.24
 
-## Current Architecture Analysis
+## Implementation Status
 
-### Current Implementation
-
-1. **Font Backend** (`font_ft.c`): Uses FreeType + Cairo
-   - FreeType for font loading and variable font support
-   - Cairo for glyph rasterization (both COLR color fonts and regular fonts)
-   - Variable font support via `FT_Set_Var_Design_Coordinates()`
-   - Single codepoint rendering only
-
-2. **Rendering Pipeline** (`renderer.c`):
-   - Renders one codepoint at a time
-   - Creates SDL_Texture from Cairo-rendered glyph bitmap
-   - No text shaping (no ligatures, combining marks, etc.)
-
-### Limitations
-
-- **Cairo Dependency**: Heavy dependency for simple rasterization
-- **No Complex Shaping**: Cannot handle multi-codepoint sequences properly
-- **No Kerning**: HarfBuzz shaping needed for proper glyph positioning
-- **Performance**: Multiple library overhead (FreeType → Cairo → SDL)
-- **Missing Features**: Ligatures, emoji sequences, combining marks not properly rendered
-
-## Proposed Architecture
-
-### Overview
-
-```
-┌─────────────────┐
-│   Terminal      │
-│   (libvterm)    │
-└────────┬────────┘
-         │ Codepoint sequences
-         ▼
-┌─────────────────────────────────────────────────┐
-│         Font Rendering Layer                    │
-│  ┌──────────────┐  ┌──────────────┐            │
-│  │  FreeType    │  │  HarfBuzz    │            │
-│  │  - Load font │  │  - Shape text│            │
-│  │  - Variations│  │  - Positioning│            │
-│  │  - Rasterize │  │  - Ligatures │            │
-│  └──────┬───────┘  └──────┬───────┘            │
-│         │ Glyph bitmaps   │ Glyph positions    │
-│         └─────────┬────────┘                    │
-│                   ▼                             │
-│         ┌───────────────────┐                   │
-│         │  Texture Manager  │                   │
-│         │  - SDL Surface    │                   │
-│         │  - SDL Texture    │                   │
-│         └─────────┬─────────┘                   │
-└───────────────────┼─────────────────────────────┘
-                    │
-                    ▼
-         ┌─────────────────┐
-         │   SDL3 Renderer │
-         │   (GPU/Texture) │
-         └─────────────────┘
-```
-
-### Component Redesign
-
-## 1. FreeType Integration (Variable Fonts + Rasterization)
-
-### 1.1 Variable Font Axis Management
-
-**Font Data Structure** (`font_ft.c`):
-
-```c
-typedef struct {
-    FT_Face ft_face;
-    hb_font_t *hb_font;           // NEW: HarfBuzz font wrapper
-    float font_size;
-    FontStyle style;
-
-    // Variable font information
-    FT_MM_Var *mm_var;             // NEW: Cache MM_Var for performance
-    int num_axes;
-    struct {
-        FT_ULong tag;              // e.g., 'wght', 'wdth'
-        char name[64];
-        float min_value;
-        float default_value;
-        float max_value;
-        float current_value;       // Current setting
-    } *axes;                       // Dynamic array of axis info
-
-    // Rendering options
-    bool antialias;
-    int hinting;
-    int hint_style;
-    int ft_load_flags;
-    int dpi_x, dpi_y;
-
-    // COLR support
-    bool has_colr;
-    FT_Color *palette;             // NEW: Use FreeType's COLR API
-    FT_UShort palette_size;
-} FtFontData;
-```
-
-**API: Set Variable Font Coordinates**
-
-```c
-// Set specific axis value (e.g., Weight=600)
-bool ft_set_axis_value(FtFontData *ft_data, const char *axis_tag, float value);
-
-// Set all axes at once
-bool ft_set_all_axes(FtFontData *ft_data, float *coords, int num_coords);
-```
-
-**Implementation Details:**
-
-1. **Axis Discovery**: At font load time, call `FT_Get_MM_Var()` and cache axis information
-2. **Coordinate Setting**:
-   - Use `FT_Set_Var_Design_Coordinates()` to set FreeType axis values
-   - Immediately call `hb_ft_font_changed()` to sync HarfBuzz with FreeType changes
-3. **Common Axes**:
-   - `wght` (Weight): 100-900 (Thin to Black)
-   - `wdth` (Width): 50-200 (Condensed to Expanded)
-   - `slnt` (Slant): -15 to 0 (Italic angle)
-   - `ital` (Italic): 0-1 (Boolean italic switch)
-
-**Example Usage:**
-
-```c
-// For bold style
-ft_set_axis_value(ft_data, "wght", 700.0f);
-
-// For condensed bold
-float coords[2] = {700.0f, 75.0f}; // wght=700, wdth=75
-ft_set_all_axes(ft_data, coords, 2);
-```
-
-### 1.2 Color Font Support (COLR v0/v1)
-
-**Remove Cairo, use FreeType native COLR:**
-
-```c
-// Check and load COLR palette
-static bool load_colr_palette(FtFontData *ft_data) {
-    FT_UInt num_palettes = 0;
-    FT_Error error = FT_Palette_Data_Get(ft_data->ft_face, NULL);
-    if (error) return false;
-
-    // Get default palette (index 0)
-    FT_Palette_Data palette_data;
-    FT_Palette_Data_Get(ft_data->ft_face, &palette_data);
-
-    FT_Color *palette = malloc(palette_data.num_palette_entries * sizeof(FT_Color));
-    error = FT_Palette_Select(ft_data->ft_face, 0, &palette);
-
-    if (error == 0) {
-        ft_data->palette = palette;
-        ft_data->palette_size = palette_data.num_palette_entries;
-        ft_data->has_colr = true;
-        return true;
-    }
-    return false;
-}
-
-// Render COLR glyph layers
-static GlyphBitmap *render_colr_glyph(FtFontData *ft_data, FT_UInt glyph_index) {
-    // Use FT_Get_Color_Glyph_Layer() to iterate layers
-    // Composite each layer with its palette color
-    // Return final RGBA bitmap
-}
-```
-
-### 1.3 Glyph Rasterization
-
-**Implementation** (replaces Cairo entirely):
-
-```c
-// Render single glyph to RGBA bitmap
-static GlyphBitmap *rasterize_glyph(FtFontData *ft_data, FT_UInt glyph_index,
-                                     uint8_t fg_r, uint8_t fg_g, uint8_t fg_b) {
-    FT_Load_Glyph(ft_data->ft_face, glyph_index, ft_data->ft_load_flags);
-
-    // Handle COLR glyphs specially
-    if (ft_data->has_colr && FT_HAS_COLOR(ft_data->ft_face)) {
-        return render_colr_glyph(ft_data, glyph_index);
-    }
-
-    // Regular rasterization
-    FT_Render_Glyph(ft_data->ft_face->glyph,
-                    ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO);
-
-    FT_Bitmap *bitmap = &ft_data->ft_face->glyph->bitmap;
-
-    // Convert to RGBA (existing code, works fine)
-    GlyphBitmap *result = malloc(sizeof(GlyphBitmap));
-    result->width = bitmap->width;
-    result->height = bitmap->rows;
-    result->x_offset = ft_data->ft_face->glyph->bitmap_left;
-    result->y_offset = ft_data->ft_face->glyph->bitmap_top;
-    result->advance = ft_data->ft_face->glyph->advance.x >> 6;
-
-    // Allocate RGBA pixels and convert (grayscale/mono to RGBA)
-    result->pixels = malloc(result->width * result->height * 4);
-    // ... conversion code (existing code works)
-
-    return result;
-}
-```
-
-## 2. HarfBuzz Integration (Text Shaping)
-
-### 2.1 Core Shaping Pipeline
-
-**New Structure: Shaped Glyph Run**
-
-```c
-typedef struct {
-    int num_glyphs;                  // Number of glyphs after shaping
-    FT_UInt *glyph_indices;          // Glyph IDs (not codepoints!)
-    int32_t *x_positions;            // X position deltas (26.6 fixed point)
-    int32_t *y_positions;            // Y position deltas (26.6 fixed point)
-    int32_t *x_advances;             // X advance widths (26.6 fixed point)
-    int32_t *y_advances;             // Y advance widths (26.6 fixed point)
-    uint32_t *clusters;              // Cluster mapping back to input codepoints
-} ShapedGlyphRun;
-```
-
-**Shaping Function:**
-
-```c
-ShapedGlyphRun *shape_text(FtFontData *ft_data,
-                           uint32_t *codepoints,
-                           int codepoint_count,
-                           hb_direction_t direction) {
-    // Create HarfBuzz buffer
-    hb_buffer_t *buf = hb_buffer_create();
-    hb_buffer_set_direction(buf, direction);  // HB_DIRECTION_LTR, HB_DIRECTION_RTL
-    hb_buffer_set_script(buf, HB_SCRIPT_LATIN);  // Auto-detect in production
-    hb_buffer_set_language(buf, hb_language_from_string("en", -1));
-
-    // Add codepoints to buffer
-    for (int i = 0; i < codepoint_count; i++) {
-        hb_buffer_add(buf, codepoints[i], i);
-    }
-    hb_buffer_guess_segment_properties(buf);
-
-    // Shape the text
-    hb_shape(ft_data->hb_font, buf, NULL, 0);
-
-    // Extract glyph information
-    unsigned int glyph_count;
-    hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, &glyph_count);
-    hb_glyph_position_t *glyph_pos = hb_buffer_get_glyph_positions(buf, &glyph_count);
-
-    // Allocate result
-    ShapedGlyphRun *run = malloc(sizeof(ShapedGlyphRun));
-    run->num_glyphs = glyph_count;
-    run->glyph_indices = malloc(glyph_count * sizeof(FT_UInt));
-    run->x_positions = malloc(glyph_count * sizeof(int32_t));
-    run->y_positions = malloc(glyph_count * sizeof(int32_t));
-    run->x_advances = malloc(glyph_count * sizeof(int32_t));
-    run->y_advances = malloc(glyph_count * sizeof(int32_t));
-    run->clusters = malloc(glyph_count * sizeof(uint32_t));
-
-    // Copy shaped data
-    int32_t cursor_x = 0, cursor_y = 0;
-    for (unsigned int i = 0; i < glyph_count; i++) {
-        run->glyph_indices[i] = glyph_info[i].codepoint;  // Now a glyph ID!
-        run->x_positions[i] = cursor_x + glyph_pos[i].x_offset;
-        run->y_positions[i] = cursor_y + glyph_pos[i].y_offset;
-        run->x_advances[i] = glyph_pos[i].x_advance;
-        run->y_advances[i] = glyph_pos[i].y_advance;
-        run->clusters[i] = glyph_info[i].cluster;
-
-        cursor_x += glyph_pos[i].x_advance;
-        cursor_y += glyph_pos[i].y_advance;
-    }
-
-    hb_buffer_destroy(buf);
-    return run;
-}
-```
-
-### 2.2 Font Instance Setup
-
-**Initialize HarfBuzz Font from FreeType:**
-
-```c
-static hb_font_t *create_hb_font(FT_Face ft_face) {
-    // Create HarfBuzz font from FreeType face
-    hb_font_t *hb_font = hb_ft_font_create_referenced(ft_face);
-
-    // HarfBuzz will automatically use FreeType's rendering
-    return hb_font;
-}
-
-// When variable font coords change:
-static void sync_variations_to_harfbuzz(FtFontData *ft_data) {
-    // After calling FT_Set_Var_Design_Coordinates(), call:
-    hb_ft_font_changed(ft_data->hb_font);
-
-    // Or manually set coords in HarfBuzz:
-    // float coords[N] = {weight, width, ...};
-    // hb_font_set_var_coords_design(ft_data->hb_font, coords, N);
-}
-```
-
-### 2.3 Example Shaping Scenarios
-
-**Ligatures:**
-
-```
-Input:  ['f', 'i']           (2 codepoints)
-Output: [glyph_id=312]       (1 glyph - "fi" ligature)
-```
-
-**Emoji Sequence:**
-
-```
-Input:  [U+1F1FA, U+1F1F8]   (US flag: 🇺🇸)
-Output: [glyph_id=1523]      (1 glyph - flag emoji)
-```
-
-**Combining Marks:**
-
-```
-Input:  ['a', U+0301]        (a + combining acute accent)
-Output: [glyph_id=65, glyph_id=456 with y_offset=-200]
-```
-
-## 3. SDL3 Integration
-
-### 3.1 Texture Upload Strategy
-
-**Option A: Traditional SDL_Renderer (RECOMMENDED for terminal)**
-
-```c
-static SDL_Texture *upload_glyph_to_texture(Renderer *rend, GlyphBitmap *bitmap) {
-    // Create SDL surface from RGBA bitmap
-    SDL_Surface *surface = SDL_CreateSurface(bitmap->width, bitmap->height,
-                                             SDL_PIXELFORMAT_RGBA32);
-    memcpy(surface->pixels, bitmap->pixels, bitmap->width * bitmap->height * 4);
-
-    // Create texture from surface
-    SDL_Texture *texture = SDL_CreateTextureFromSurface(rend->renderer, surface);
-    SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
-    SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
-
-    SDL_DestroySurface(surface);
-    return texture;
-}
-```
-
-**Option B: SDL3 GPU API (for future optimization)**
-
-```c
-// For advanced use: Direct GPU texture upload
-SDL_GPUTexture *upload_to_gpu(SDL_GPUDevice *device, GlyphBitmap *bitmap) {
-    SDL_GPUTextureCreateInfo create_info = {
-        .type = SDL_GPU_TEXTURETYPE_2D,
-        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        .width = bitmap->width,
-        .height = bitmap->height,
-        .layer_count_or_depth = 1,
-        .num_levels = 1
-    };
-
-    SDL_GPUTexture *texture = SDL_CreateGPUTexture(device, &create_info);
-
-    // Upload pixel data
-    SDL_GPUTransferBuffer *transfer = SDL_CreateGPUTransferBuffer(device, ...);
-    // ... map, copy pixels, unmap
-    SDL_UploadToGPUTexture(command_buffer, transfer, texture, ...);
-
-    return texture;
-}
-```
-
-**Recommendation**: Start with Option A (SDL_Renderer + SDL_Texture) for simplicity and compatibility. Terminal emulators don't typically need GPU API-level control.
-
-### 3.2 Rendering Pipeline
-
-```c
-void renderer_draw_shaped_text(Renderer *rend, ShapedGlyphRun *run,
-                                FtFontData *ft_data,
-                                int base_x, int base_y,
-                                uint8_t r, uint8_t g, uint8_t b) {
-    int pen_x = base_x;
-    int pen_y = base_y;
-
-    for (int i = 0; i < run->num_glyphs; i++) {
-        // Rasterize glyph
-        GlyphBitmap *bitmap = rasterize_glyph(ft_data, run->glyph_indices[i], r, g, b);
-
-        // Calculate position (convert from 26.6 fixed point)
-        int x = pen_x + (run->x_positions[i] >> 6) + bitmap->x_offset;
-        int y = pen_y - (run->y_positions[i] >> 6) - bitmap->y_offset;
-
-        // Create and render texture
-        SDL_Texture *tex = upload_glyph_to_texture(rend, bitmap);
-        SDL_FRect dst = {x, y, bitmap->width, bitmap->height};
-        SDL_RenderTexture(rend->renderer, tex, NULL, &dst);
-
-        SDL_DestroyTexture(tex);
-        free_glyph_bitmap(bitmap);
-
-        // Advance pen (convert from 26.6 fixed point)
-        pen_x += (run->x_advances[i] >> 6);
-        pen_y += (run->y_advances[i] >> 6);
-    }
-}
-```
-
-## 4. Updated Font Interface API
-
-### 4.1 Modified `font.h`
-
-```c
-// NEW: Shaped glyph output structure
-typedef struct ShapedGlyphs {
-    int num_glyphs;
-    GlyphBitmap **bitmaps;        // Array of rasterized glyphs
-    int *x_positions;              // Pixel positions
-    int *y_positions;
-    int *x_advances;
-    int total_advance;             // Total width of shaped run
-} ShapedGlyphs;
-
-// Enhanced Font interface
-struct Font {
-    // ... existing fields ...
-
-    // NEW: Multi-codepoint shaping and rendering
-    ShapedGlyphs *(*render_shaped)(Font *font, void *font_data,
-                                   uint32_t *codepoints, int codepoint_count,
-                                   uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
-
-    // NEW: Variable font axis control
-    bool (*set_variation_axis)(Font *font, void *font_data,
-                               const char *axis_tag, float value);
-
-    // Keep existing for backward compat
-    GlyphBitmap *(*render_glyphs)(Font *font, void *font_data,
-                                  uint32_t *codepoints, int codepoint_count,
-                                  uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
-};
-
-// Public API
-ShapedGlyphs *font_render_shaped_text(Font *font, FontStyle style,
-                                       uint32_t *codepoints, int count,
-                                       uint8_t r, uint8_t g, uint8_t b);
-```
-
-## 5. Migration Plan
-
-### Phase 1: Foundation (Week 1-2)
+### ✅ Phase 1: Foundation (COMPLETED)
 
 **Goal:** Replace Cairo with pure FreeType rasterization
 
-1. **Remove Cairo dependency:**
-   - Delete all `#include <cairo/*.h>`
-   - Remove Cairo code from `font_ft.c` (lines 11-12, 499-726)
-   - Update build system (`configure.ac`, `Makefile.am`) to remove cairo deps
+**Completed:**
 
-2. **Implement FreeType-only rasterization:**
-   - Keep existing `rasterize_glyph()` function (lines 359-497) - it already works without Cairo
-   - Test with regular monochrome fonts
+- ✅ Removed Cairo dependency from build system and code
+- ✅ Implemented FreeType-only rasterization for grayscale/monochrome glyphs
+- ✅ COLR v0 layer compositing via `FT_Get_Color_Glyph_Layer()` implemented
+- ✅ COLR v1 paint graph traversal implemented:
+  - `render_colr_paint_glyph()` - Entry point using `FT_Get_Color_Glyph_Paint()`
+  - `paint_colr_paint_recursive()` - Recursive paint evaluator
+  - Paint types implemented: PaintSolid, PaintLinearGradient, PaintRadialGradient, PaintSweepGradient, PaintTranslate, PaintScale, PaintRotate, PaintSkew, PaintColrGlyph, PaintColrLayers, PaintComposite (SRC_OVER, PLUS, MULTIPLY), PaintGlyph (mask-based)
+- ✅ Affine transform matrix helpers implemented
+- ✅ BGRA→RGBA conversion for `FT_LOAD_COLOR` fast path
 
-3. **COLR support via FreeType native APIs:**
-   - Implement `load_colr_palette()`
-   - Implement `render_colr_glyph()` using `FT_Get_Color_Glyph_Layer()`
-   - Test with color emoji fonts (Noto Color Emoji, etc.)
+**Build system:**
 
-**Deliverable:** Cairo-free build that renders text correctly
+- ✅ Cairo removed from `configure.ac` and `src/Makefile.am`
+- ✅ Project builds successfully without Cairo
 
-### Phase 2: HarfBuzz Integration (Week 3-4)
+### ✅ Phase 2: HarfBuzz Integration (COMPLETED)
 
 **Goal:** Add text shaping support
 
-1. **Add HarfBuzz build dependency:**
-   - Update `configure.ac`: `PKG_CHECK_MODULES([HARFBUZZ], [harfbuzz >= 2.0])`
-   - Update `Makefile.am` to include HarfBuzz CFLAGS/LIBS
+**Completed:**
 
-2. **Implement shaping pipeline:**
-   - Add `hb_font_t` to `FtFontData` structure
-   - Implement `create_hb_font()`
-   - Implement `shape_text()` function
-   - Implement `sync_variations_to_harfbuzz()`
+- ✅ HarfBuzz dependency added to build system
+- ✅ `hb_font_t` added to `FtFontData` structure
+- ✅ `hb_ft_font_create_referenced()` used at font init time
+- ✅ Variable font sync: `hb_ft_font_changed()` called after `FT_Set_Var_Design_Coordinates()`
+- ✅ `ft_render_shaped()` implemented: shapes with HarfBuzz, rasterizes per-glyph with FreeType
+- ✅ `ShapedGlyphs` structure exposed in public API
+- ✅ Variable font axis APIs: `ft_set_variation_axis()` and `ft_set_variation_axes()` implemented
+- ✅ MM_Var caching for performance
 
-3. **Update variable font handling:**
-   - Modify `apply_font_variations()` to call `hb_ft_font_changed()` after setting coords
-   - Add axis caching for performance
-
-4. **Create `render_shaped()` backend function:**
-   - Shape codepoints with HarfBuzz
-   - Rasterize each glyph with FreeType
-   - Return `ShapedGlyphs` structure with positioned bitmaps
-
-**Deliverable:** Ligatures, combining marks, emoji sequences work correctly
-
-### Phase 3: Renderer Integration (Week 5)
+### ✅ Phase 3: Renderer Integration (COMPLETED)
 
 **Goal:** Wire shaped text rendering into display pipeline
 
-1. **Modify `renderer.c`:**
-   - Add `renderer_draw_shaped_text()` function
-   - Detect multi-codepoint sequences from terminal
-   - Call shaped rendering for complex text
-   - Fall back to simple rendering for ASCII
+**Completed:**
 
-2. **Optimize texture management:**
-   - Consider glyph caching (LRU cache)
-   - Batch texture uploads where possible
+- ✅ Renderer detects multi-codepoint sequences and calls `font_render_shaped_text()`
+- ✅ Per-glyph texture upload with LRU cache implemented
+- ✅ Shaped run positioning integrated (HarfBuzz x/y positions used)
 
-**Deliverable:** Terminal displays ligatures and complex text correctly
+### ❌ Phase 4: Bug Fixes & Correctness (CURRENT - BLOCKED)
 
-### Phase 4: Testing & Optimization (Week 6)
+**Goal:** Fix critical bugs preventing emoji rendering
 
-**Goal:** Verify correctness and performance
+**Status:** Emoji font loads with COLR table detected, but glyphs render as empty/1x1 bitmaps
 
-1. **Test cases:**
-   - ASCII text (basic sanity)
-   - Ligatures: "fi", "fl", "ff", "ffi" in appropriate fonts
-   - Emoji sequences: 🇺🇸 (flags), 👨‍👩‍👧‍👦 (family with ZWJ)
-   - Combining marks: à, é, ñ (a+grave, e+acute, n+tilde)
-   - Variable fonts: Bold vs Normal weight rendering
-   - RTL text: Arabic, Hebrew (if needed)
+---
 
-2. **Performance optimization:**
-   - Profile glyph rasterization vs shaping
-   - Implement glyph cache if needed
-   - Benchmark vs old Cairo implementation
+## Critical Bugs Discovered (MUST FIX)
 
-3. **Documentation:**
-   - Update AGENTS.md with new architecture
-   - Document variable font axis support
-   - Add examples for complex text
+### Bug 1: FT_Get_Color_Glyph_ClipBox Double-Scaling ⚠️ CRITICAL
 
-**Deliverable:** Production-ready implementation
+**Location:** `src/font_ft.c:1298-1306` (in `render_colr_paint_glyph`)
 
-## 6. Build System Changes
+**Problem:**
 
-### 6.1 configure.ac
+```c
+// CURRENT (WRONG):
+double blx = ft_pos_to_double(clip.bottom_left.x);  // Converts 26.6 → pixels
+double bly = ft_pos_to_double(clip.bottom_left.y);
+double trx = ft_pos_to_double(clip.top_right.x);
+double try_ = ft_pos_to_double(clip.top_right.y);
+xoff = (int)floor(blx * ft_data->scale);        // ❌ DOUBLE SCALING
+yoff = (int)ceil(try_ * ft_data->scale);        // ❌ DOUBLE SCALING
+out_w = (int)ceil((trx - blx) * ft_data->scale); // ❌ DOUBLE SCALING
+out_h = (int)ceil((try_ - bly) * ft_data->scale); // ❌ DOUBLE SCALING
+```
+
+**FreeType Documentation:**
+
+> The clip box is computed taking scale and transformations configured on the @FT_Face into account. @FT_ClipBox contains @FT_Vector values in 26.6 format.
+
+**Root Cause:**
+
+- `FT_Get_Color_Glyph_ClipBox` returns coordinates **already in pixel space** (26.6 fixed-point)
+- `ft_pos_to_double()` correctly converts 26.6 → pixels (divide by 64)
+- Code then **multiplies by `ft_data->scale` again** (font_size / units_per_EM)
+- Result: Bounding box shrinks by ~1/64 to 1/1024, collapsing to 1x1
+
+**Fix Required:**
+
+```c
+// CORRECT:
+xoff = (int)floor(blx);              // Remove * ft_data->scale
+yoff = (int)ceil(try_);              // Remove * ft_data->scale
+out_w = (int)ceil(trx - blx);        // Remove * ft_data->scale
+out_h = (int)ceil(try_ - bly);       // Remove * ft_data->scale
+```
+
+**Impact:** This bug causes ALL COLR v1 emoji to render as 1x1 or empty bitmaps.
+
+---
+
+### Bug 2: Wrong Case Label for PaintGlyph ⚠️ CRITICAL
+
+**Location:** `src/font_ft.c:1205`
+
+**Problem:**
+
+```c
+case FT_COLR_PAINTFORMAT_TRANSFORM:  // ❌ WRONG! Should be PAINTFORMAT_GLYPH
+{
+    FT_PaintGlyph *pg = &paint.u.glyph;  // Code handles PaintGlyph, not PaintTransform
+    ...
+}
+```
+
+**FreeType ftcolor.h enum values:**
+
+- `FT_COLR_PAINTFORMAT_GLYPH = 10`
+- `FT_COLR_PAINTFORMAT_TRANSFORM = 12`
+
+**Root Cause:**
+
+- Case label is `PAINTFORMAT_TRANSFORM` (enum value 12)
+- Code body uses `paint.u.glyph` which is for `PAINTFORMAT_GLYPH` (enum value 10)
+- Result: PaintGlyph (format 10) falls through to default case and returns transparent
+
+**Fix Required:**
+
+```c
+case FT_COLR_PAINTFORMAT_GLYPH:  // Correct enum value
+{
+    FT_PaintGlyph *pg = &paint.u.glyph;
+    ...
+}
+```
+
+**Additionally:** Need to implement actual `FT_COLR_PAINTFORMAT_TRANSFORM` case which uses `paint.u.transform.affine` and `paint.u.transform.paint`.
+
+**Impact:** PaintGlyph nodes (critical for many emoji) are not being handled, causing rendering failures.
+
+---
+
+### Bug 3: Root Transform Coordinate Space Confusion ⚠️ MODERATE
+
+**Location:** `src/font_ft.c:1277, 1348-1350` (in `render_colr_paint_glyph`)
+
+**Problem:**
+
+```c
+int got = FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index,
+                                   FT_COLOR_INCLUDE_ROOT_TRANSFORM, &root);
+...
+if (root_paint.format == FT_COLR_PAINTFORMAT_TRANSFORM) {
+    affine_from_FT_Affine23(&root_matrix, &root_paint.u.transform.affine);
+    matrix_maps_font_units = true;  // ❌ Incorrect assumption
+}
+```
+
+**FreeType Documentation:**
+
+> When this function returns an initially computed root transform, at the time of executing the @FT_PaintGlyph operation, the contours should be retrieved using @FT_Load_Glyph at unscaled, untransformed size. This is because the root transform applied to the graphics context will take care of correct scaling.
+>
+> Subsequent @FT_COLR_Paint structures contain unscaled and untransformed values.
+
+**Root Cause:**
+
+- When `FT_COLOR_INCLUDE_ROOT_TRANSFORM` is used, FreeType returns paint coordinates in **font units** (unscaled)
+- The root transform contains the **upem→pixel scaling** (from `FT_Set_Char_Size`)
+- Code sets `matrix_maps_font_units = true` only if root paint is a TRANSFORM node
+- If root paint is NOT a transform (e.g., direct PaintColrLayers), `matrix_maps_font_units` stays false and gradient coordinates get **double-scaled**
+
+**Fix Required:**
+
+1. Always set `matrix_maps_font_units = true` when using `FT_COLOR_INCLUDE_ROOT_TRANSFORM`
+2. OR: Use `FT_COLOR_NO_ROOT_TRANSFORM` and manually scale all paint coordinates
+
+---
+
+### Bug 4: Missing PaintTransform Case
+
+**Location:** `src/font_ft.c` - missing case in switch statement
+
+**Problem:**
+
+- `FT_COLR_PAINTFORMAT_TRANSFORM` (enum value 12) has no case handler
+- This is different from PaintTranslate/PaintScale/PaintRotate/PaintSkew which are specific transform types
+- PaintTransform is a general affine transform wrapper
+
+**Fix Required:**
+Implement:
+
+```c
+case FT_COLR_PAINTFORMAT_TRANSFORM:
+{
+    FT_PaintTransform *pt = &paint.u.transform;
+    Affine local;
+    affine_from_FT_Affine23(&local, &pt->affine);
+    Affine next;
+    affine_mul(&next, matrix, &local);
+    return paint_colr_paint_recursive(ft_data, pt->paint, &next,
+                                      matrix_maps_font_units, buf, w, h,
+                                      dst_x_off, dst_y_off, fg_r, fg_g, fg_b);
+}
+```
+
+---
+
+## Remaining Work
+
+### Immediate (Blockers for Emoji Rendering)
+
+1. **Fix ClipBox double-scaling** (Bug 1)
+   - Remove `* ft_data->scale` from lines 1303-1306
+   - Test with emoji to verify correct bounding box dimensions
+
+2. **Fix PaintGlyph case label** (Bug 2)
+   - Change line 1205 from `PAINTFORMAT_TRANSFORM` to `PAINTFORMAT_GLYPH`
+   - Add actual `PAINTFORMAT_TRANSFORM` case
+
+3. **Fix root transform coordinate logic** (Bug 3)
+   - Set `matrix_maps_font_units = true` when using `FT_COLOR_INCLUDE_ROOT_TRANSFORM` regardless of root paint type
+   - OR switch to `FT_COLOR_NO_ROOT_TRANSFORM` and apply scaling in paint evaluation
+
+4. **Test emoji rendering**
+   - Verify `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -` renders emoji correctly
+   - Check that COLR v1 paint path produces non-empty bitmaps
+
+### Secondary (Correctness & Coverage)
+
+5. **Implement remaining composite modes**
+   - Currently implemented: SRC_OVER, PLUS, MULTIPLY
+   - Missing: SCREEN, OVERLAY, DARKEN, LIGHTEN, COLOR_DODGE, COLOR_BURN, HARD_LIGHT, SOFT_LIGHT, DIFFERENCE, EXCLUSION, HUE, SATURATION, COLOR, LUMINOSITY, SRC, DEST, SRC_IN, SRC_OUT, DEST_IN, DEST_OUT, SRC_ATOP, DEST_ATOP, XOR
+   - Refer to FreeType ftcolor.h `FT_Composite_Mode` enum (line 446-479)
+
+6. **Implement PaintExtend modes**
+   - Currently: Only PAD is implemented (clamp to [0,1])
+   - Missing: REPEAT, REFLECT
+   - Location: `eval_colorline()` should return extend mode; gradient functions should apply it
+   - Apply to t-value calculation in gradients before color interpolation
+
+7. **PaintGlyph offset handling**
+   - Review lines 1220, 1227-1228 for potential double-offset bug
+   - Child paint recursive call passes `left + dst_x_off` but compositing subtracts `dst_x_off` again
+
+8. **Optimize gradient evaluation**
+   - Current: Per-pixel CPU gradient evaluation
+   - Consider: GPU shader-based gradients or FreeType internal rasterization
+
+### Nice-to-Have (Future Enhancements)
+
+9. **Font fallback chain**
+   - Current: Single emoji font selected via fontconfig "emoji" pattern
+   - Improvement: Fallback to multiple fonts for broader Unicode coverage
+
+10. **BiDi/RTL support**
+    - Use HarfBuzz direction/script detection
+    - Implement proper RTL shaping
+
+11. **Texture atlas**
+    - Current: Per-glyph SDL_Texture with LRU cache
+    - Optimization: Pack glyphs into atlas texture for batch rendering
+
+12. **Extended variable font axes**
+    - Current: Weight (wght) supported
+    - Add: Width (wdth), Slant (slnt), Italic (ital), Optical Size (opsz), Grade (GRAD)
+
+---
+
+## Technical Details
+
+### Current Font Pipeline
+
+```
+Codepoint(s) → HarfBuzz shaping → Glyph IDs + positions
+                                      ↓
+                              FreeType rasterization
+                              (COLR v1/v0 or grayscale)
+                                      ↓
+                              RGBA bitmap (GlyphBitmap)
+                                      ↓
+                              SDL_Texture upload (LRU cache)
+                                      ↓
+                              SDL_RenderTexture
+```
+
+### COLR v1 Paint Evaluation Pipeline
+
+```
+FT_Get_Color_Glyph_Paint(glyph_id, FT_COLOR_INCLUDE_ROOT_TRANSFORM)
+         ↓
+FT_Get_Paint(opaque_paint) → FT_COLR_Paint
+         ↓
+paint_colr_paint_recursive() - recursively evaluate:
+  - PaintSolid → fill with color
+  - PaintLinearGradient → per-pixel gradient evaluation
+  - PaintRadialGradient → radial distance-based interpolation
+  - PaintSweepGradient → angle-based interpolation
+  - PaintGlyph → rasterize mask, apply child paint via mask
+  - PaintColrGlyph → inline nested glyph's paint graph
+  - PaintColrLayers → composite layers with FT_Get_Paint_Layers
+  - PaintComposite → blend src/backdrop with composite operator
+  - PaintTranslate/Scale/Rotate/Skew → apply affine transform to matrix
+         ↓
+RGBA buffer (out_w × out_h) → GlyphBitmap
+```
+
+### Coordinate Spaces (IMPORTANT)
+
+**FreeType COLR v1 has two coordinate space modes:**
+
+1. **With `FT_COLOR_INCLUDE_ROOT_TRANSFORM`:**
+   - Root paint contains upem→pixel transform (from `FT_Set_Char_Size`)
+   - All subsequent paint coordinates are in **font units** (unscaled)
+   - Client must apply root transform OR scale coordinates
+
+2. **With `FT_COLOR_NO_ROOT_TRANSFORM`:**
+   - No root transform returned
+   - Paint coordinates are in **font units**
+   - Client must scale all coordinates by (font_size / units_per_EM)
+
+**FT_Get_Color_Glyph_ClipBox:**
+
+- Always returns coordinates in **pixel space** (26.6 fixed-point)
+- Already accounts for `FT_Set_Char_Size` scaling
+- Should NOT be multiplied by `ft_data->scale` again
+
+---
+
+## Known Issues Preventing Emoji Rendering
+
+### Issue 1: Emoji glyphs render as 1×1 tiny bitmaps
+
+**Symptom:**
+
+```
+DEBUG:   Selected font: emoji (style=2) has_colr=1
+DEBUG: Rendering glyph U+1F600 with direct FreeType (style=2)
+DEBUG: rasterize_glyph_index: COLR v1 paint rendered for glyph 1780: 1x1
+DEBUG: create_texture_from_glyph_bitmap: empty glyph bitmap (0x0)
+```
+
+**Root Cause:** Bug 1 (ClipBox double-scaling)
+
+**Effect:** Emoji bounding boxes collapse to 1×1 or 0×0, no visible rendering
+
+---
+
+### Issue 2: Some COLR v1 emoji fail to get paint graph
+
+**Symptom:**
+
+```
+DEBUG: FT_Get_Color_Glyph_Paint with INCLUDE_ROOT_TRANSFORM failed for glyph 1, trying NO_ROOT_TRANSFORM
+DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM and NO_ROOT_TRANSFORM)
+```
+
+**Possible Causes:**
+
+- Glyph ID 1 may not have a COLR v1 paint graph (could be .notdef or a base glyph)
+- Font may use COLR v0 for this glyph instead
+- Need to check if FT_Get_Color_Glyph_Layer (v0 API) succeeds for these
+
+---
+
+### Issue 3: PaintGlyph nodes not handled
+
+**Root Cause:** Bug 2 (wrong case label)
+
+**Effect:** Any emoji using PaintGlyph in its paint graph will fail to render
+
+---
+
+### Issue 4: Coordinate space mismatch for gradients
+
+**Root Cause:** Bug 3 (matrix_maps_font_units logic)
+
+**Effect:** Gradient coordinates may be scaled incorrectly, causing gradients to render at wrong positions/sizes
+
+---
+
+## TODO List (Priority Order)
+
+### P0 - Critical (Emoji Rendering Blockers)
+
+- [ ] **Fix Bug 1:** Remove `* ft_data->scale` from ClipBox conversion (lines 1303-1306)
+- [ ] **Fix Bug 2:** Change case label from `PAINTFORMAT_TRANSFORM` to `PAINTFORMAT_GLYPH` (line 1205)
+- [ ] **Implement Bug 4:** Add actual `FT_COLR_PAINTFORMAT_TRANSFORM` case handler
+- [ ] **Test:** Verify `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -` renders emoji
+
+### P1 - High (Correctness)
+
+- [ ] **Fix Bug 3:** Clarify root transform coordinate handling
+  - Option A: Always set `matrix_maps_font_units = true` with `FT_COLOR_INCLUDE_ROOT_TRANSFORM`
+  - Option B: Switch to `FT_COLOR_NO_ROOT_TRANSFORM` and manually scale paint coords
+- [ ] **Review PaintGlyph offsets:** Check lines 1220, 1227-1228 for double-offset bug
+- [ ] **Add logging:** Log bbox dimensions, paint formats encountered, coordinate values for debugging
+
+### P2 - Medium (Coverage)
+
+- [ ] **Implement PaintExtend:** REPEAT and REFLECT modes in gradients
+- [ ] **Implement more composite modes:** Start with SCREEN, XOR, SRC_IN, DEST_IN
+- [ ] **Handle COLR v0 fallback:** When v1 paint graph not found, try `FT_Get_Color_Glyph_Layer`
+- [ ] **Emoji ZWJ sequences:** Ensure HarfBuzz shaping handles multi-codepoint emoji (family, flag sequences)
+
+### P3 - Low (Optimization & Polish)
+
+- [ ] **Glyph cache optimization:** Tune LRU cache size, consider different eviction policies
+- [ ] **Texture atlas:** Batch multiple glyphs into single texture
+- [ ] **GPU upload optimization:** Consider SDL3 GPU API for faster uploads
+- [ ] **Variable font UI:** Expose axis control to user (future)
+
+---
+
+## Key Code Locations
+
+**Font Backend:** `src/font_ft.c`
+
+- Lines 19-59: `FtFontData` structure (FreeType + HarfBuzz state)
+- Lines 113-146: `cache_mm_var()` - Variable font axis caching
+- Lines 226-239: `check_colr_table()` - COLR table detection
+- Lines 241-264: `load_colr_palette()` - COLR palette loading
+- Lines 266-459: `render_colr_glyph()` - COLR v0 layer compositing
+- Lines 570-650: `rasterize_glyph_mask()` - Glyph mask for PaintGlyph
+- Lines 719-743: `eval_colorline()` - Color stop extraction
+- Lines 745-834: `paint_linear_gradient()` - Linear gradient evaluation
+- Lines 838-1266: `paint_colr_paint_recursive()` - **CORE PAINT EVALUATOR**
+- Lines 1269-1347: `render_colr_paint_glyph()` - COLR v1 entry point
+- Lines 1815-1985: `rasterize_glyph_index()` - Glyph rasterization dispatcher
+- Lines 1987-2053: `ft_render_shaped()` - HarfBuzz shaping + rasterization
+
+**Renderer:** `src/renderer.c`
+
+- Lines 116-129: `renderer_get_cached_texture()` - Glyph cache lookup
+- Lines 131-171: `renderer_cache_texture()` - LRU cache insertion
+- Lines 342-578: `renderer_draw_terminal()` - **MAIN RENDER LOOP**
+- Lines 453-459: Font selection logic (emoji vs normal vs bold)
+- Lines 464-504: Shaped run rendering path
+
+**Font API:** `src/font.c`, `src/font.h`
+
+- `ShapedGlyphs` structure exposed for HarfBuzz-shaped runs
+- `font_render_shaped_text()` - Public API for shaped rendering
+- `font_set_variation_axis()` / `font_set_variation_axes()` - Variable font control
+- `font_style_has_colr()` - Check if loaded font has COLR table
+
+---
+
+## Testing Strategy
+
+### Manual Tests (Current)
 
 ```bash
-# Remove Cairo
-# PKG_CHECK_MODULES([CAIRO], [cairo >= 1.10])
-# PKG_CHECK_MODULES([CAIRO_FT], [cairo-ft >= 1.10])
+# Emoji rendering test (currently produces 1x1 bitmaps)
+./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -
 
-# Add HarfBuzz (if not already present)
-PKG_CHECK_MODULES([HARFBUZZ], [harfbuzz >= 2.0])
-
-# Keep FreeType
-PKG_CHECK_MODULES([FREETYPE], [freetype2 >= 2.10])
+# Verbose logging shows:
+# - Font resolution (Noto Color Emoji found)
+# - COLR table detection (has_colr=1)
+# - Paint rendering attempts
+# - Bounding box dimensions (currently 1x1 - BUG)
 ```
 
-### 6.2 Makefile.am
+### After Bug Fixes
 
-```makefile
-# Update CFLAGS and LIBS
-AM_CFLAGS = $(SDL3_CFLAGS) $(FREETYPE_CFLAGS) $(HARFBUZZ_CFLAGS) \
-            $(VTERM_CFLAGS) $(FONTCONFIG_CFLAGS)
+Expected behavior:
 
-LIBS = $(SDL3_LIBS) $(FREETYPE_LIBS) $(HARFBUZZ_LIBS) \
-       $(VTERM_LIBS) $(FONTCONFIG_LIBS)
-```
+- Emoji glyphs should render at ~24-40 pixel dimensions (based on font_size=24)
+- COLR v1 paint path should produce colorful emoji bitmaps
+- "rasterize_glyph_index: COLR v1 paint rendered for glyph X: WxH" should show W,H > 1
 
-## 7. API Reference Summary
+### Automated Tests (Future)
 
-### FreeType APIs Used
-
-```c
-FT_Get_MM_Var()                      // Get variable font axes
-FT_Set_Var_Design_Coordinates()      // Set axis values (e.g., Weight=600)
-FT_Load_Glyph()                      // Load glyph by index
-FT_Render_Glyph()                    // Rasterize to bitmap
-FT_Palette_Select()                  // Load COLR palette
-FT_Get_Color_Glyph_Layer()           // Iterate COLR layers
-```
-
-### HarfBuzz APIs Used
-
-```c
-hb_ft_font_create_referenced()       // Create HB font from FT_Face
-hb_font_set_var_coords_design()      // Sync variable font coords
-hb_ft_font_changed()                 // Notify font changed
-hb_buffer_create()                   // Create text buffer
-hb_buffer_add()                      // Add codepoints
-hb_shape()                           // Shape text
-hb_buffer_get_glyph_infos()          // Get glyph IDs
-hb_buffer_get_glyph_positions()      // Get positions and advances
-```
-
-### SDL3 APIs Used
-
-```c
-SDL_CreateSurface()                  // Create RGBA surface
-SDL_CreateTextureFromSurface()       // Upload to GPU
-SDL_SetTextureBlendMode()            // Enable alpha blending
-SDL_RenderTexture()                  // Draw textured quad
-SDL_DestroyTexture()                 // Free GPU resource
-```
-
-## 8. Benefits of New Architecture
-
-### Features
-
-- ✅ **Variable Font Support**: Full control via FT_Set_Var_Design_Coordinates + hb_font_set_var_coords_design
-- ✅ **Complex Shaping**: Ligatures, emoji, combining marks via HarfBuzz
-- ✅ **Correct Kerning**: HarfBuzz provides proper glyph positioning
-- ✅ **Color Emoji**: FreeType native COLR support (no Cairo needed)
-- ✅ **Simpler Stack**: FreeType → SDL (no Cairo middleman)
-
-### Performance
-
-- Fewer library dependencies (remove Cairo)
-- Direct bitmap upload to SDL textures
-- Potential for glyph caching at shaped-run level
-
-### Maintainability
-
-- Industry-standard text stack (FT + HB)
-- Better alignment with modern font technologies
-- Clearer separation: FT=raster, HB=shape, SDL=display
-
-## 9. Backward Compatibility
-
-- Single-codepoint rendering still works (`render_glyphs` with count=1)
-- Falls back to simple rendering for ASCII/Latin text
-- Shaped rendering opt-in for complex sequences
-- All existing font loading code preserved
-
-## 10. Future Enhancements
-
-1. **Glyph Cache**: LRU cache for frequently used shaped runs
-2. **BiDi Support**: Use HarfBuzz's bidirectional text support
-3. **Font Fallback Chain**: Multiple fonts for Unicode coverage
-4. **Subpixel Rendering**: FreeType LCD filtering + SDL alpha blending
-5. **GPU Performance**: Migrate to SDL3 GPU API for even faster uploads
+- Golden image comparison for emoji rendering
+- Unit tests for coordinate conversion (26.6 → pixels)
+- Regression tests for COLR v1 paint types
 
 ---
 
-## Decisions Made
+## API Reference
 
-Based on the recommendations in Section 9, the following decisions have been finalized:
+### FreeType COLR v1 APIs
 
-1. **GPU API**: Use SDL_Renderer (simple) for initial implementation
-   - Migration to SDL3 GPU API documented in FUTURE_ENHANCEMENTS.md
+```c
+FT_Get_Color_Glyph_Paint()       // Get root paint (with/without root transform)
+FT_Get_Paint()                   // Evaluate FT_OpaquePaint → FT_COLR_Paint
+FT_Get_Paint_Layers()            // Iterate PaintColrLayers
+FT_Get_Colorline_Stops()         // Extract gradient color stops
+FT_Get_Color_Glyph_ClipBox()     // Get bounding box (ALREADY IN PIXELS)
+FT_Palette_Select()              // Load COLR palette
+FT_Palette_Data_Get()            // Get palette metadata
+```
 
-2. **COLR Migration**: Migrate to FreeType native (consistent stack)
-   - Remove Cairo dependency completely
-   - Use FT*Palette*\* and FT_Get_Color_Glyph_Layer APIs
+### HarfBuzz APIs
 
-3. **Variable Font Axes**: Start with Weight (wght) and Width (wdth)
-   - Additional axes (slnt, ital, opsz, GRAD) documented in FUTURE_ENHANCEMENTS.md
-
-4. **Text Direction**: LTR only initially
-   - Full BiDi support documented in FUTURE_ENHANCEMENTS.md
-
-5. **Caching Strategy**: Render on-demand initially
-   - LRU glyph caching documented in FUTURE_ENHANCEMENTS.md for Phase 4 optimization
-
-See `FUTURE_ENHANCEMENTS.md` for detailed designs of deferred features.
+```c
+hb_ft_font_create_referenced()   // Create HB font from FT_Face
+hb_ft_font_changed()             // Sync after FT_Set_Var_Design_Coordinates
+hb_buffer_add_utf32()            // Add codepoints to buffer
+hb_shape()                       // Shape text
+hb_buffer_get_glyph_infos()      // Get shaped glyph IDs
+hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
+```
 
 ---
 
-**Document Version:** 2.1  
-**Date:** 2026-01-22  
-**Status:** Design Complete - Ready for Implementation
+## Architecture Decisions
+
+### 1. COLR Rendering Strategy
+
+**Decision:** Use `FT_COLOR_INCLUDE_ROOT_TRANSFORM`
+
+- FreeType provides upem→pixel transform
+- Paint coordinates are in font units
+- Requires careful handling of `matrix_maps_font_units` flag
+
+**Alternative:** Use `FT_COLOR_NO_ROOT_TRANSFORM` and manually scale all paint coords
+
+- Simpler mental model
+- More explicit control
+- May reconsider after root transform bugs are fixed
+
+### 2. Texture Upload
+
+**Decision:** SDL_Renderer + per-glyph SDL_Texture (Option A)
+
+- Simple, compatible with all SDL3 backends
+- Works well with LRU cache
+- Terminal emulator use case doesn't need GPU API complexity
+
+**Future:** SDL3 GPU API for batched uploads (documented in FUTURE_ENHANCEMENTS.md)
+
+### 3. Shaping Strategy
+
+**Decision:** Shape when `cp_count > 1` (multi-codepoint cells)
+
+- Fallback to simple rendering for single ASCII characters
+- Emoji/ZWJ sequences automatically use shaped path
+- Flag sequences (🇺🇸 = U+1F1FA U+1F1F8) handled via shaping
+
+### 4. Cache Strategy
+
+**Decision:** LRU cache with 1024 entries
+
+- Key: (font_data pointer, glyph_id, color)
+- Eviction: Least-recently-used
+- Size: Reasonable for terminal use (covers most visible glyphs)
+
+---
+
+## Current Status Summary
+
+### Working
+
+✅ Build system (Cairo removed, HarfBuzz added)
+✅ FreeType rasterization for regular fonts
+✅ HarfBuzz shaping integration
+✅ Variable font axis control
+✅ COLR v0 layer compositing
+✅ COLR v1 paint traversal infrastructure
+✅ Basic paint types (Solid, gradients)
+✅ Affine transforms (Translate, Scale, Rotate, Skew)
+✅ Renderer integration with shaped runs
+✅ Glyph texture caching
+
+### Broken (Blocking Emoji)
+
+❌ **COLR v1 emoji render as 1×1 bitmaps** (Bug 1: ClipBox double-scaling)
+❌ **PaintGlyph not handled** (Bug 2: Wrong case label)
+❌ **PaintTransform missing** (Bug 4)
+
+### Incomplete (Need Work)
+
+⚠️ Root transform coordinate handling (Bug 3)
+⚠️ PaintExtend modes (REPEAT, REFLECT)
+⚠️ Many composite operators
+⚠️ Some paint types may have edge cases
+
+---
+
+## Next Steps (Immediate)
+
+1. **Fix Bug 1** (ClipBox scaling) - `src/font_ft.c:1303-1306`
+2. **Fix Bug 2** (PaintGlyph case) - `src/font_ft.c:1205`
+3. **Implement Bug 4** (PaintTransform case) - add to switch statement
+4. **Test emoji:** `./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -`
+5. **Verify non-empty bitmaps** in logs: "COLR v1 paint rendered for glyph X: WxH" where W,H >> 1
+
+After these fixes, emoji rendering should work and we can proceed to secondary improvements.
+
+---
+
+**Document Version:** 3.0  
+**Last Updated:** 2026-01-22  
+**Status:** Implementation In Progress - Critical Bugs Identified

@@ -149,3 +149,13 @@ bool font_has_style(Font *font, FontStyle style)
     return font && style < FONT_STYLE_COUNT &&
            (font->loaded_styles & (1u << style));
 }
+
+// Check if a loaded style supports COLR (color glyphs)
+bool font_style_has_colr(Font *font, FontStyle style)
+{
+    if (!font || style >= FONT_STYLE_COUNT || !(font->loaded_styles & (1u << style)))
+        return false;
+    if (!font->style_has_colr)
+        return false;
+    return font->style_has_colr(font, font->font_data[style]);
+}
