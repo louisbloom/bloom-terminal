@@ -785,7 +785,7 @@ static void paint_linear_gradient(FtFontData *ft_data, FT_PaintLinearGradient *l
         for (int x = 0; x < w; x++) {
             // pixel center coordinates in destination space
             double px = (double)(x + dst_x_off);
-            double py = (double)(y + dst_y_off);
+            double py = (double)(dst_y_off - y); // Y-flip: convert from pixel Y-down to FreeType Y-up
             // vector from p0 to pixel
             double vx = px - tp0x;
             double vy = py - tp0y;
@@ -896,7 +896,7 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 double px = (double)(x + dst_x_off);
-                double py = (double)(y + dst_y_off);
+                double py = (double)(dst_y_off - y); // Y-flip: convert from pixel Y-down to FreeType Y-up
                 // distance to c0
                 double d = hypot(px - tc0x, py - tc0y);
                 double denom = (r1 - r0);
@@ -963,7 +963,7 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 double px = (double)(x + dst_x_off);
-                double py = (double)(y + dst_y_off);
+                double py = (double)(dst_y_off - y); // Y-flip: convert from pixel Y-down to FreeType Y-up
                 double vx = px - tcx;
                 double vy = py - tcy;
                 // compute angle in degrees measured counter-clockwise from positive y axis
@@ -1217,7 +1217,7 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
         }
 
         FT_OpaquePaint child = pg->paint;
-        paint_colr_paint_recursive(ft_data, child, matrix, matrix_maps_font_units, tmp, mw, mh, left + dst_x_off, (top - mh) + dst_y_off, fg_r, fg_g, fg_b);
+        paint_colr_paint_recursive(ft_data, child, matrix, matrix_maps_font_units, tmp, mw, mh, left, top, fg_r, fg_g, fg_b);
 
         for (int y = 0; y < mh; y++) {
             for (int x = 0; x < mw; x++) {
@@ -1225,7 +1225,7 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
                 if (mask_a == 0)
                     continue;
                 int dst_x = left + x - dst_x_off;
-                int dst_y = (top - mh) + y - dst_y_off;
+                int dst_y = dst_y_off - top + y; // Y-flip: convert from FreeType Y-up to pixel Y-down
                 if (dst_x < 0 || dst_x >= w || dst_y < 0 || dst_y >= h)
                     continue;
 
@@ -1363,7 +1363,7 @@ static GlyphBitmap *render_colr_paint_glyph(FtFontData *ft_data, FT_UInt glyph_i
         affine_from_FT_Affine23(&root_matrix, &root_paint.u.transform.affine);
     }
 
-    paint_colr_paint_recursive(ft_data, root, &root_matrix, matrix_maps_font_units, out->pixels, out_w, out_h, 0, 0, fg_r, fg_g, fg_b);
+    paint_colr_paint_recursive(ft_data, root, &root_matrix, matrix_maps_font_units, out->pixels, out_w, out_h, xoff, yoff, fg_r, fg_g, fg_b);
 
     return out;
 }
