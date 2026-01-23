@@ -1202,7 +1202,7 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
         }
         return true;
     }
-    case FT_COLR_PAINTFORMAT_TRANSFORM:
+    case FT_COLR_PAINTFORMAT_GLYPH:
     {
         FT_PaintGlyph *pg = &paint.u.glyph;
         int mw = 0, mh = 0, left = 0, top = 0;
@@ -1253,6 +1253,15 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
         free(tmp);
         return true;
     }
+    case FT_COLR_PAINTFORMAT_TRANSFORM:
+    {
+        FT_PaintTransform *pt = &paint.u.transform;
+        Affine local;
+        affine_from_FT_Affine23(&local, &pt->affine);
+        Affine next;
+        affine_mul(&next, matrix, &local);
+        return paint_colr_paint_recursive(ft_data, pt->paint, &next, matrix_maps_font_units, buf, w, h, dst_x_off, dst_y_off, fg_r, fg_g, fg_b);
+    }
     default:
         // Unsupported paint types fall back to solid transparent
         vlog("Unsupported FT_COLR paint format: %d\n", paint.format);
@@ -1274,8 +1283,11 @@ static GlyphBitmap *render_colr_paint_glyph(FtFontData *ft_data, FT_UInt glyph_i
         return NULL;
 
     FT_OpaquePaint root = { NULL, 0 };
+    bool have_root_transform = false;
     int got = FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index, FT_COLOR_INCLUDE_ROOT_TRANSFORM, &root);
-    if (!got) {
+    if (got) {
+        have_root_transform = true;
+    } else {
         vlog("FT_Get_Color_Glyph_Paint with INCLUDE_ROOT_TRANSFORM failed for glyph %u, trying NO_ROOT_TRANSFORM\n", glyph_index);
         if (!FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index, FT_COLOR_NO_ROOT_TRANSFORM, &root)) {
             vlog("FT_Get_Color_Glyph_Paint failed for glyph %u (both INCLUDE_ROOT_TRANSFORM and NO_ROOT_TRANSFORM)\n", glyph_index);
@@ -1300,10 +1312,10 @@ static GlyphBitmap *render_colr_paint_glyph(FtFontData *ft_data, FT_UInt glyph_i
         double bly = ft_pos_to_double(clip.bottom_left.y);
         double trx = ft_pos_to_double(clip.top_right.x);
         double try_ = ft_pos_to_double(clip.top_right.y);
-        xoff = (int)floor(blx * ft_data->scale);
-        yoff = (int)ceil(try_ * ft_data->scale);
-        out_w = (int)ceil((trx - blx) * ft_data->scale);
-        out_h = (int)ceil((try_ - bly) * ft_data->scale);
+        xoff = (int)floor(blx);
+        yoff = (int)ceil(try_);
+        out_w = (int)ceil(trx - blx);
+        out_h = (int)ceil(try_ - bly);
         if (out_w <= 0 || out_h <= 0)
             return NULL;
     } else {
@@ -1341,13 +1353,14 @@ static GlyphBitmap *render_colr_paint_glyph(FtFontData *ft_data, FT_UInt glyph_i
     affine_identity(&identity);
 
     // Evaluate root paint into out->pixels
-    // Decide whether root is a transform that maps font-units->pixels
-    bool matrix_maps_font_units = false;
+    // Decide whether paint coordinates are in font units or pixels
+    // When FT_COLOR_INCLUDE_ROOT_TRANSFORM is used, FreeType returns all paint
+    // coordinates in font units (unscaled). Otherwise, they're in pixels.
+    bool matrix_maps_font_units = have_root_transform;
     Affine root_matrix;
     affine_identity(&root_matrix);
     if (root_paint.format == FT_COLR_PAINTFORMAT_TRANSFORM) {
         affine_from_FT_Affine23(&root_matrix, &root_paint.u.transform.affine);
-        matrix_maps_font_units = true;
     }
 
     paint_colr_paint_recursive(ft_data, root, &root_matrix, matrix_maps_font_units, out->pixels, out_w, out_h, 0, 0, fg_r, fg_g, fg_b);
