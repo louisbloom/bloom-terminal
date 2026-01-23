@@ -107,95 +107,120 @@ static int combine_cells_for_emoji(Terminal *term, int row, int col,
                                    int max_combined,
                                    int *columns_consumed)
 {
-    // Limit how far we look ahead to the same row
-    int term_cols;
-    terminal_get_dimensions(term, NULL, &term_cols);
+    int term_rows, term_cols;
+    terminal_get_dimensions(term, &term_rows, &term_cols);
 
-    // Maximum lookahead - don't go past terminal columns
-    int max_lookahead = term_cols - col; // Remaining columns from current position
+    // Read the first cell
+    VTermScreenCell cell;
+    if (terminal_get_cell(term, row, col, &cell) < 0 || cell.chars[0] == 0) {
+        *columns_consumed = 0;
+        return 0;
+    }
 
-    // Maximum cells we can combine (conservative limit)
-    int max_cells = (max_lookahead < VTERM_MAX_CHARS_PER_CELL) ? max_lookahead : VTERM_MAX_CHARS_PER_CELL;
+    vlog("combine_cells_for_emoji: starting at (%d,%d), first char=U+%04X, width=%d, term_cols=%d\n",
+         row, col, cell.chars[0], cell.width, term_cols);
 
-    // Start with what we already know - the first cell's content
-    int current_cp_count = 0;
-    int total_columns_consumed = 0;
-
-    // Collect all potentially combinable codepoints starting from this cell
-    // We'll go forward as long as we can find emoji-compatible codepoints in subsequent cells
-    for (int offset = 0; offset < max_cells; offset++) {
-        if (col + offset >= term_cols || current_cp_count >= max_combined - 1) {
+    // Collect first cell's codepoints
+    int cp_count = 0;
+    for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
+        if (cp_count >= max_combined - 1) {
             break;
         }
+        combined_codepoints[cp_count++] = cell.chars[i];
+        vlog("  Added U+%04X from first cell\n", cell.chars[i]);
+    }
 
-        VTermScreenCell cell;
-        if (terminal_get_cell(term, row, col + offset, &cell) < 0) {
-            break;
+    int col_offset = cell.width;          // Track column offset (not cell offset!)
+    int lookahead_col = col + cell.width; // Next column to check
+
+    // Look ahead for combinable cells
+    const int MAX_LOOKAHEAD = 10; // Maximum cells to look ahead
+    int cells_checked = 1;        // Already checked first cell
+
+    vlog("  Looking ahead starting from column %d\n", lookahead_col);
+
+    while (lookahead_col < term_cols && cells_checked < MAX_LOOKAHEAD) {
+        VTermScreenCell next_cell;
+        if (terminal_get_cell(term, row, lookahead_col, &next_cell) < 0) {
+            vlog("  Can't read cell at column %d\n", lookahead_col);
+            break; // Can't read cell
         }
 
-        // If this is an empty cell or has no characters, stop combining
-        if (cell.chars[0] == 0) {
-            // Even if the cell is empty, we still need to account for its column width
-            total_columns_consumed += 1;
-            break;
+        if (next_cell.chars[0] == 0) {
+            vlog("  Empty cell at column %d\n", lookahead_col);
+            break; // Empty cell, end of content
         }
 
-        // Add all codepoints from this cell
-        for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
-            if (current_cp_count >= max_combined - 1) {
-                break;
+        // Check if we should combine this cell
+        uint32_t first_cp = next_cell.chars[0];
+        vlog("  Checking cell at column %d: U+%04X (width=%d)\n", lookahead_col, first_cp, next_cell.width);
+        bool should_combine = false;
+
+        // Check if we just collected a ZWJ - if so, continue to get the next emoji
+        if (cp_count > 0 && is_zwj(combined_codepoints[cp_count - 1])) {
+            // After ZWJ, combine next emoji
+            if (is_emoji_base_range(first_cp)) {
+                should_combine = true;
             }
-
-            uint32_t cp = cell.chars[i];
-
-            // Add this codepoint to our combined array
-            combined_codepoints[current_cp_count++] = cp;
         }
-
-        // Track columns consumed by this cell (consider its actual width)
-        total_columns_consumed += cell.width;
-
-        // Check if we should stop combining based on the NEXT cell
-        // This is the key fix from document 04: check the next cell content
-        // instead of last codepoint we collected
-
-        // Check if the next cell exists and has content
-        if (col + offset + 1 < term_cols) {
-            VTermScreenCell next_cell;
-            if (terminal_get_cell(term, row, col + offset + 1, &next_cell) == 0) {
-                uint32_t next_cp = next_cell.chars[0];
-                if (next_cp != 0) {
-                    // If the next cell has content, check if we should combine it
-                    if (is_zwj(next_cp)) {
-                        // Continue accumulating more codepoints for ZWJ sequences
-                        continue;
-                    }
-                    // If current cell's last codepoint is a skin tone modifier or regional indicator,
-                    // or we need to combine based on the next cell, continue combining
-                    if (current_cp_count > 0 && is_skin_tone_modifier(combined_codepoints[current_cp_count - 1])) {
-                        continue;
-                    }
-                    if (current_cp_count > 0 && is_regional_indicator(combined_codepoints[current_cp_count - 1])) {
-                        continue;
-                    }
+        // Check if next cell has a skin tone modifier
+        else if (is_skin_tone_modifier(first_cp)) {
+            vlog("  Next cell U+%04X is skin tone modifier\n", first_cp);
+            // Skin tone can combine with base emoji
+            if (cp_count > 0 && is_emoji_base_range(combined_codepoints[0])) {
+                vlog("  And we have base emoji U+%04X - should combine!\n", combined_codepoints[0]);
+                should_combine = true;
+            } else {
+                vlog("  But no base emoji (cp_count=%d, first=U+%04X)\n", cp_count,
+                     cp_count > 0 ? combined_codepoints[0] : 0);
+            }
+        }
+        // Check if we're collecting regional indicators for a flag
+        else if (is_regional_indicator(first_cp)) {
+            // Check if first codepoint is also RI
+            if (cp_count > 0 && is_regional_indicator(combined_codepoints[0])) {
+                // Only combine first two RIs (flag emoji)
+                if (cp_count == 1) {
+                    should_combine = true;
                 }
             }
-        } else {
-            // This is the last cell we check, we're not going to continue
-            break;
         }
+        // Check if next cell has ZWJ - always combine ZWJ
+        else if (is_zwj(first_cp)) {
+            should_combine = true;
+        }
+
+        if (!should_combine) {
+            vlog("  Not combining with U+%04X at col %d\n", first_cp, lookahead_col);
+            break; // Not part of sequence
+        }
+
+        vlog("  Combining with U+%04X at col %d (width=%d)\n", first_cp, lookahead_col, next_cell.width);
+
+        // Add this cell's codepoints
+        for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && next_cell.chars[i] != 0; i++) {
+            if (cp_count >= max_combined - 1) {
+                break;
+            }
+            combined_codepoints[cp_count++] = next_cell.chars[i];
+        }
+
+        col_offset += next_cell.width;
+        lookahead_col += next_cell.width; // Advance by cell width, not 1
+        cells_checked++;
     }
 
     // Ensure null termination for safety
-    if (current_cp_count < max_combined) {
-        combined_codepoints[current_cp_count] = 0; // null terminate
+    if (cp_count < max_combined) {
+        combined_codepoints[cp_count] = 0; // null terminate
     }
 
+    vlog("combine_cells_for_emoji: collected %d codepoints, %d columns consumed\n",
+         cp_count, col_offset);
+
     // Return number of codepoints that were combined
-    if (columns_consumed) {
-        *columns_consumed = total_columns_consumed;
-    }
-    return current_cp_count;
+    *columns_consumed = col_offset;
+    return cp_count;
 }
 
 // Glyph cache entry
@@ -596,6 +621,9 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                 uint32_t combined_cps[VTERM_MAX_CHARS_PER_CELL * 2]; // Allow for combining
                 int combined_cp_count = 0;
 
+                // Track how many columns this rendering will consume (for skip tracking)
+                int columns_to_consume = cell.width; // Default: this cell's width
+
                 // If the first character looks like an emoji, check for combining
                 if (cell.chars[0] != 0 && (is_emoji_presentation(cell.chars[0]) ||
                                            is_regional_indicator(cell.chars[0]) ||
@@ -612,6 +640,7 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                         // Update the last_combined_col to skip the cells we consumed
                         // Use columns_consumed instead of combined_cp_count for correct skip tracking
                         last_combined_col = col + columns_consumed - 1;
+                        columns_to_consume = columns_consumed;
 
                         // Use the combined codepoints
                         cp_count = combined_cp_count;
@@ -619,13 +648,13 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                             cps[i] = combined_cps[i];
                         }
                     } else {
-                        // Fall back to regular single-cell handling
+                        // Fall back to regular single-cell handling (simple emoji)
                         for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
                             cps[cp_count++] = cell.chars[i];
                         }
                     }
                 } else {
-                    // Regular single-cell handling
+                    // Regular single-cell handling (non-emoji)
                     for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
                         cps[cp_count++] = cell.chars[i];
                     }
@@ -689,6 +718,9 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                         free(shaped->y_positions);
                         free(shaped->x_advances);
                         free(shaped);
+
+                        // Update skip tracking to prevent re-rendering continuation cells
+                        last_rendered_col = col + columns_to_consume - 1;
                         continue; // done with this cell
                     }
                 }
@@ -723,6 +755,9 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                     }
                     rend->font->free_glyph_bitmap(rend->font, glyph_bitmap);
                 }
+
+                // Update skip tracking to prevent re-rendering continuation cells
+                last_rendered_col = col + columns_to_consume - 1;
             }
 
             // Render cursor if this is the cursor position
