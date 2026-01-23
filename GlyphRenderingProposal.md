@@ -20,12 +20,11 @@ This document tracks the redesign of the glyph rendering system to eliminate Cai
    - **Issue**: Skin tone modifiers render as separate glyphs (👋 + 🏻 instead of 👋🏻)
    - **Issue**: Flag emoji render as separate regional indicators (🇺 + 🇸 instead of 🇺🇸)
    - **Issue**: Family emoji render as individual people instead of combined group
-   - **Root cause**: **`combine_cells_for_emoji()` exists but is NEVER CALLED**
-   - **Location of dead code**: `src/renderer.c:107-216` - fully implemented but unused
-   - **Location of bug**: `src/renderer.c:598-603` - only collects codepoints from single cell
+   - **Root cause**: The renderer currently only collects codepoints from a single cell. The emoji combining infrastructure (helpers + a combine function) was removed during a git restore and does NOT exist in the current tree; it must be implemented and integrated into the render loop.
+   - **Current location where changes are needed**: `src/renderer.c` - see "What Needs to Be Added" in LINE_NUMBER_CORRECTIONS.md for exact insertion points
    - **Solution designed**: See "Multi-Codepoint Emoji Fix Design" section below
    - **Affected**: Skin tones, flags, ZWJ sequences (family, professions, etc.)
-   - **Status**: Fix designed and ready to implement
+   - **Status**: Fix designed and ready to implement (requires adding helpers and combine function)
 
 2. **Debug complex COLR v1 rendering issues** 🟡 PARTIAL
    - **Issue**: Some vehicle emoji (🚗🚕🚙) render as gray/white boxes
@@ -192,10 +191,9 @@ Terminal Layer (libvterm):          Rendering Layer (our code):
 
 **Reason 1: We Already Have the Infrastructure**
 
-- `combine_cells_for_emoji()` already exists (lines 107-216)
-- Emoji detection helpers already exist
-- HarfBuzz shaping path already handles multi-codepoint arrays
-- Just need to wire it up
+- The rendering pipeline and HarfBuzz shaping path already exist
+- HarfBuzz shaping will handle combined codepoint arrays once provided
+- We need to add emoji detection helpers and a cell combining function, then call it from the render loop
 
 **Reason 2: Rendering is the Right Layer**
 
@@ -213,25 +211,20 @@ Renderers MUST lookahead for many reasons:
 - **WezTerm**: Handles emoji combining at renderer level
 - **Standard practice**: Terminal layer stores cells, renderer combines for display
 
-**Reason 4: Minimal Change**
+**Reason 4: Minimal Change at Correct Layer**
 
-Our fix is ~25 lines of code in renderer.c:
-
-- Add skip tracking (3 lines)
-- Call existing combine function (20 lines)
-- No libvterm changes needed
-- No external dependency changes
+Integration requires adding helpers and a combining function, and wiring them into the existing render loop and shaping path.
 
 ### Conclusion: Renderer-Level Fix is Correct
 
-**The split happens at libvterm level** (by design), but **the fix belongs at renderer level** (by architecture).
+The split happens at libvterm level (by design), but the fix belongs at renderer level (by architecture).
 
 This is not a workaround - it's the proper separation of concerns:
 
 - **libvterm**: Faithful character cell representation
 - **Renderer**: Semantic understanding and presentation
 
-Our fix follows industry best practices and requires minimal code changes.
+Our fix follows industry best practices and requires adding implementation and wiring in `src/renderer.c`.
 
 ---
 
@@ -239,166 +232,81 @@ Our fix follows industry best practices and requires minimal code changes.
 
 ### Research Findings (2026-01-23)
 
-**Discovery:** The code to fix emoji sequences ALREADY EXISTS but is never called!
+**Discovery:** During recent research the renderer file was restored to a clean state and the emoji combining code that previously existed was removed. The current codebase does NOT contain emoji detection helpers or a `combine_cells_for_emoji()` implementation; these must be added.
 
 **Evidence:**
 
-- `src/renderer.c:107-216` contains `combine_cells_for_emoji()` function
-- Handles skin tone modifiers, ZWJ sequences, and regional indicators
-- Fully implemented with proper lookahead logic
-- **BUT**: `grep -r "combine_cells_for_emoji" src/` returns NO CALLS to this function
+- `src/renderer.c` is currently ~599 lines long and lacks emoji-specific logic
+- Lines 439-444 currently collect codepoints from a single cell only (bug location)
+- Line 465 contains the shaped rendering check (`if (cp_count > 1 && rend->font && rend->font->render_shaped)`), which never triggers for emoji sequences because `cp_count` is always 1 for emoji stored across multiple cells
 
-**Current Broken Flow:**
+**What the new code must do:**
 
-```
-src/renderer.c:375-554 - Main rendering loop
-  ├─ Line 376: for (int col = 0; col < display_cols; col++)
-  ├─ Line 377: VTermScreenCell cell; terminal_get_cell(term, row, col, &cell)
-  ├─ Lines 598-603: Collect codepoints from SINGLE CELL ONLY:
-  │     for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
-  │         cps[cp_count++] = cell.chars[i];
-  │     }
-  └─ Line 624: if (cp_count > 1) ... shaped rendering
-      └─ NEVER TRIGGERED because each cell has cp_count=1
-```
-
-**What `combine_cells_for_emoji()` Does:**
-
-- **Input**: Terminal, row, col, output buffer
-- **Output**: Combined codepoint array with count
-- **Logic**:
-  1. Starts at given col, reads first cell
-  2. Looks ahead to next cells (up to 5 cells)
-  3. If next cell is skin tone modifier (U+1F3FB-U+1F3FF): combine
-  4. If next cell is ZWJ (U+200D): collect entire ZWJ chain
-  5. If current cell is regional indicator: combine with next RI for flags
-  6. Returns total codepoint count and updates array
-
-**Why It's Not Called:**
-
-- Likely implemented in anticipation of the problem
-- Integration was never completed
-- Rendering loop uses simpler single-cell logic
+- Add emoji detection helpers
+- Add a `combine_cells_for_emoji()` function that looks ahead across cells on the same row and produces a combined UTF-32 codepoint array
+- Integrate skip-tracking into the render loop so combined cells are not re-rendered
+- Use existing shaped rendering path by passing combined arrays to HarfBuzz
 
 ### Solution Design
 
-**Approach:** Use existing `combine_cells_for_emoji()` with cell skip tracking
+**Approach:** Implement emoji helpers and `combine_cells_for_emoji()` and integrate them into the main rendering loop with skip tracking.
 
 **Required Changes:**
 
 **File: `src/renderer.c`**
 
-**Change 1: Add skip tracking before cell loop (line ~375)**
+**Change 1: Add emoji detection helpers (after header/initial helpers)**
 
 ```c
-// Render each cell
+// Emoji helper functions (to be added near top of renderer.c)
+static bool is_emoji_presentation(uint32_t cp);
+static bool is_regional_indicator(uint32_t cp);
+static bool is_zwj(uint32_t cp);
+static bool is_skin_tone_modifier(uint32_t cp);
+```
+
+**Change 2: Add cell combining function (after helpers, before renderer internals)**
+
+```c
+static int combine_cells_for_emoji(Terminal *term, int row, int col,
+                                   uint32_t *combined_codepoints,
+                                   int max_combined);
+// Full implementation ~100 lines
+```
+
+**Change 3: Add skip tracking in row loop (line ~375)**
+
+```c
 for (int row = 0; row < display_rows; row++) {
-    // NEW: Track cells consumed by emoji combining
-    int last_combined_col = -1;
-
+    int last_combined_col = -1;  // Track cells consumed by emoji combining
     for (int col = 0; col < display_cols; col++) {
-        // NEW: Skip cells already consumed
-        if (col <= last_combined_col) {
-            continue;
-        }
-
+        if (col <= last_combined_col) continue; // skip cells already consumed
         VTermScreenCell cell;
-        if (terminal_get_cell(term, row, col, &cell) < 0) {
-            continue;
-        }
-        /* ... rest of loop ... */
+        ...
 ```
 
-**Change 2: Replace single-cell codepoint collection (lines ~598-603)**
+**Change 4: Replace single-cell codepoint collection (lines 439-444)**
 
-```c
-// OLD CODE (lines 598-603):
-uint32_t cps[VTERM_MAX_CHARS_PER_CELL];
-int cp_count = 0;
-for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
-    cps[cp_count++] = cell.chars[i];
-}
+- Detect if first codepoint looks emoji-like
+- If so, call `combine_cells_for_emoji()` and obtain a combined array and count
+- Update `last_combined_col` based on actual cells consumed (or conservative heuristic `col + cp_count - 1`)
+- Otherwise use existing single-cell collection
 
-// NEW CODE:
-#define MAX_COMBINED_CODEPOINTS 16
-uint32_t cps[MAX_COMBINED_CODEPOINTS];
-int cp_count = 0;
+**Change 5: Keep shaped rendering path (lines 465-506)**
 
-// Check if first codepoint is emoji-like
-bool is_emoji_range = false;
-if (cell.chars[0] != 0) {
-    uint32_t first_cp = cell.chars[0];
-    is_emoji_range = (first_cp >= 0x1F000 && first_cp <= 0x1F9FF) ||
-                     is_regional_indicator(first_cp) ||
-                     is_emoji_presentation(first_cp);
-}
-
-// Use emoji combining for emoji codepoints
-if (is_emoji_range) {
-    cp_count = combine_cells_for_emoji(term, row, col, cps, MAX_COMBINED_CODEPOINTS);
-    if (cp_count > 1) {
-        // Calculate how many cells were consumed by examining the combined result
-        // Skin tone: 2 codepoints (base + modifier) from 2 cells
-        // Flag: 2 codepoints (2 RIs) from 2 cells
-        // ZWJ family: 7 codepoints (4 people + 3 ZWJ) from 7 cells
-        // Heuristic: count codepoints roughly equals cells consumed
-        last_combined_col = col + cp_count - 1;
-        vlog("Combined emoji at (%d,%d): %d codepoints from %d cells\n",
-             row, col, cp_count, cp_count);
-    }
-} else {
-    // Non-emoji: single cell collection
-    for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
-        cps[cp_count++] = cell.chars[i];
-    }
-}
-```
-
-**Change 3: No changes needed to shaping path**
-
-- Lines 624-664 already handle `cp_count > 1` correctly
-- HarfBuzz shaping will work once we pass combined arrays
+- No change needed; once `cp_count > 1` is produced, HarfBuzz path will work
 
 ### Implementation Notes
 
 **Cell Width Considerations:**
 
-- vterm may store emoji sequences with varying cell widths
-- Skin tone: base emoji (width 2) + modifier (width 0) = 2 total cells
-- Flag: RI (width 1) + RI (width 1) = 2 cells
-- ZWJ: person (2) + ZWJ (0) + person (2) + ZWJ (0) + ... = variable
-- **Solution**: `combine_cells_for_emoji()` returns actual cell count via column delta
-- Update `last_combined_col` based on actual cells consumed
+- vterm stores emoji pieces across cells with varying widths
+- `combine_cells_for_emoji()` should limit lookahead to same row and available display columns
+- The function should return actual codepoint count; integration will compute cells consumed by checking neighboring cell contents or using a conservative heuristic
 
-**Improved Cell Skip Logic:**
+**Skip Logic:**
 
-```c
-if (is_emoji_range) {
-    int start_col = col;
-    cp_count = combine_cells_for_emoji(term, row, col, cps, MAX_COMBINED_CODEPOINTS);
-
-    // Determine actual end column by checking cell widths
-    int cells_consumed = 1;  // At least current cell
-    for (int check_col = col + 1; check_col < display_cols && check_col < col + cp_count; check_col++) {
-        VTermScreenCell check_cell;
-        if (terminal_get_cell(term, row, check_col, &check_cell) < 0) break;
-        if (check_cell.chars[0] == 0) break;  // Hit empty cell, stop
-        cells_consumed++;
-    }
-
-    last_combined_col = col + cells_consumed - 1;
-    vlog("Emoji at (%d,%d): %d codepoints, consumed %d cells (col %d to %d)\n",
-         row, col, cp_count, cells_consumed, col, last_combined_col);
-}
-```
-
-**Alternative: Simpler Heuristic**
-
-```c
-// Since combine_cells_for_emoji() includes lookahead logic,
-// assume it consumed one cell per codepoint collected (conservative)
-last_combined_col = col + cp_count - 1;
-```
+Use `last_combined_col` to avoid re-rendering cells that were consumed by the combining function.
 
 ### Testing Strategy
 
@@ -431,12 +339,12 @@ last_combined_col = col + cp_count - 1;
 4. **Existing emoji.sh script:**
    ```bash
    ./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -
-   # Should now render all emoji sequences correctly
+   # Should render emoji sequences correctly once combining is added
    ```
 
 **Verification:**
 
-- Verbose logging (`-v`) will show "Combined emoji" messages
+- Verbose logging (`-v`) should show combination events
 - Check that skin tones, flags, and families render as single glyphs
 - Verify cell alignment remains correct (no gaps or overlaps)
 
@@ -450,17 +358,17 @@ last_combined_col = col + cp_count - 1;
 **Risk 2: Cell width misalignment**
 
 - If combining consumes wrong number of cells, cursor may desync
-- **Mitigation**: Careful testing with cell width inspection
+- **Mitigation**: Test with varied sequences and compute consumed cells conservatively
 
 **Risk 3: Non-emoji false positives**
 
 - Some Unicode ranges might be incorrectly identified as emoji
-- **Mitigation**: Use precise emoji detection (combine existing helpers)
+- **Mitigation**: Use precise emoji detection (implement helpers carefully)
 
 **Edge Case 1: Partial sequences at row end**
 
 - Flag RI-RI split across line boundary
-- **Solution**: `combine_cells_for_emoji()` already limits to current row
+- **Solution**: `combine_cells_for_emoji()` must limit to current row
 
 **Edge Case 2: Mixed emoji and text**
 
@@ -474,19 +382,14 @@ last_combined_col = col + cp_count - 1;
 
 ### Implementation Checklist
 
-- [ ] Add `last_combined_col` tracking variable in row loop
-- [ ] Add skip logic at start of col loop
-- [ ] Replace single-cell codepoint collection with conditional combining
-- [ ] Add emoji range detection helper invocation
-- [ ] Call `combine_cells_for_emoji()` for emoji codepoints
-- [ ] Calculate and set `last_combined_col` based on combined result
+- [ ] Implement emoji detection helper functions (`is_emoji_presentation`, `is_regional_indicator`, `is_zwj`, `is_skin_tone_modifier`)
+- [ ] Implement `combine_cells_for_emoji()` function (lookahead across cells, same-row only)
+- [ ] Add `last_combined_col` tracking variable and skip check in row/column loops
+- [ ] Replace single-cell codepoint collection with conditional combining logic (use conservative heuristic for consumed cells)
 - [ ] Add verbose logging for combined emoji sequences
-- [ ] Test with skin tone modifiers
-- [ ] Test with flag emoji (regional indicators)
-- [ ] Test with ZWJ family emoji
-- [ ] Test with mixed emoji and text
+- [ ] Test with skin tone modifiers, flags, and ZWJ sequences
 - [ ] Verify no gaps or overlaps in rendering
-- [ ] Run full emoji.sh test suite
+- [ ] Run full emoji.sh test suite and iterate
 
 ---
 
@@ -616,10 +519,10 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 ### P0 - Critical (Emoji Broken - FIX DESIGNED)
 
 - [ ] **Implement multi-codepoint cell combining fix** 🔴 **READY TO IMPLEMENT**
+  - Implement emoji detection helper functions and `combine_cells_for_emoji()`
   - Add `last_combined_col` skip tracking to row loop
-  - Call `combine_cells_for_emoji()` for emoji codepoints (function already exists!)
   - Replace single-cell codepoint collection with conditional combining logic
-  - **Location**: `src/renderer.c` lines 375-603
+  - **Location**: `src/renderer.c` lines ~375-506 (see LINE_NUMBER_CORRECTIONS.md for exact insert points)
   - **Test**: 👋🏻 (hand + light skin), 🇺🇸 (flag), 👨‍👩‍👧‍👦 (family)
   - **Design**: See "Multi-Codepoint Emoji Fix Design" section above
 
@@ -672,20 +575,23 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 **Renderer:** `src/renderer.c`
 
-- **Lines 69-91:** Emoji detection helpers (`is_emoji_presentation`, `is_regional_indicator`, `is_zwj`, `is_skin_tone_modifier`)
-- **Lines 107-216:** `combine_cells_for_emoji()` - **DEAD CODE (never called)**
-  - Handles skin tone modifiers (U+1F3FB-U+1F3FF)
-  - Handles ZWJ sequences (collects chain after U+200D)
-  - Handles regional indicator pairs for flags
-  - Returns combined codepoint array and count
-- Lines 116-129: `renderer_get_cached_texture()` - Glyph cache lookup
-- Lines 131-171: `renderer_cache_texture()` - LRU cache insertion
-- Lines 342-578: `renderer_draw_terminal()` - **MAIN RENDER LOOP**
-- **Lines 375-554:** Cell rendering loop - **WHERE FIX SHOULD GO**
-  - Line 376: Column loop (needs skip tracking)
-  - Lines 598-603: Single-cell codepoint collection - **NEEDS REPLACEMENT**
-  - Lines 624-664: Shaped rendering path (already works correctly)
-- Lines 453-459: Font selection logic (emoji vs normal vs bold)
+- **Lines ~57-70:** Emoji detection helpers and combining function need to be ADDED here
+- **Line 374:** `renderer_draw_terminal()` function starts
+- **Line 375:** Comment "// Render each cell"
+- **Line 375:** `for (int row = 0; row < display_rows; row++)` - **row loop**
+- **Line 376:** `for (int col = 0; col < display_cols; col++)` - **column loop**
+- **Lines 377-380:** Get cell from terminal
+- **Lines 389-397:** Color conversion
+- **Lines 399-408:** Background rendering
+- **Lines 410-413:** Skip empty cells
+- **Lines 439-444:** Single-cell codepoint collection (BUG LOCATION - must be replaced)
+- **Lines 446-459:** Font style selection (normal/bold/emoji)
+- **Line 461:** Check if font has COLR
+- **Line 465:** Shaped rendering check (works if `cp_count > 1`)
+- **Lines 465-506:** HarfBuzz shaped rendering (correct, just needs `cp_count > 1`)
+- **Lines 508-537:** Render single glyph (first codepoint only)
+- **Line 553:** End of column loop `}`
+- **Line 554:** End of row loop `}`
 
 **Font API:** `src/font.c`, `src/font.h`
 
@@ -722,19 +628,18 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
    - Input: 👋🏻 (U+1F44B + U+1F3FB)
    - Expected: Single yellow hand with light skin tone
    - Actual: Yellow hand + separate brown square
-   - **Cause**: `combine_cells_for_emoji()` exists but is never called
+   - **Cause**: Renderer collects only from single cell; combining helpers are missing
 2. **Flag emoji** (CRITICAL - FIX DESIGNED):
    - Input: 🇺🇸 (U+1F1FA + U+1F1F8)
    - Expected: US flag emoji
    - Actual: "US" as text (regional indicators render separately)
-   - **Cause**: `combine_cells_for_emoji()` exists but is never called
+   - **Cause**: Renderer collects only from single cell; combining helpers are missing
 
 3. **Family ZWJ sequences** (CRITICAL - FIX DESIGNED):
    - Input: 👨‍👩‍👧‍👦 (man + ZWJ + woman + ZWJ + girl + ZWJ + boy)
    - Expected: Single family emoji
    - Actual: Individual person emoji rendered separately
-   - **Cause**: `combine_cells_for_emoji()` exists but is never called
-
+   - **Cause**: Renderer collects only from single cell; combining helpers are missing
 4. **Vehicle emoji** (HIGH):
    - Input: 🚗🚕🚙 (cars)
    - Expected: Colorful vehicle emoji
@@ -743,10 +648,7 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 **Root Cause Analysis:**
 
-The code to fix multi-codepoint emoji **ALREADY EXISTS** in `combine_cells_for_emoji()`
-but was never integrated into the rendering loop. The rendering loop at lines 598-603
-only collects codepoints from the current cell, so the shaped rendering path
-(cp_count > 1, line 624) is never triggered for emoji sequences stored in separate cells.
+The renderer currently only gathers codepoints from the current cell (lines 439-444). During a git restore the emoji helpers and combining function were removed; these need to be implemented and integrated so that the shaped rendering path can receive multi-codepoint arrays.
 
 ### Automated Tests (Future)
 
@@ -825,10 +727,10 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 
 ### 5. Emoji Combining Strategy (NEW)
 
-**Decision:** Use existing `combine_cells_for_emoji()` with skip tracking
+**Decision:** Implement emoji detection helpers and `combine_cells_for_emoji()` and call it from the render loop
 
-- **Rationale**: Function already exists and handles all cases correctly
-- **Integration point**: Main rendering loop at line 598
+- **Rationale**: The git-restored renderer dropped prior code; re-implementing the helpers and combining function is the correct fix
+- **Integration point**: Main rendering loop at lines ~375-506
 - **Skip mechanism**: Track `last_combined_col` per row to avoid double-rendering
 - **Trigger**: Detect emoji range and call combining function
 - **HarfBuzz integration**: Pass combined codepoints to existing shaped path
@@ -854,17 +756,16 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ **COLR v1 emoji layers at correct offsets** (coordinate mapping FIXED)
 ✅ **COLR v0 fallback verified** (Three-level fallback: COLR v1 → COLR v0 → Grayscale)
 ✅ **Grayscale fallback for glyphs without COLR data** (Handles all edge cases)
-✅ **HarfBuzz shaping infrastructure** (Works when multi-codepoint cells are passed)
-✅ **Emoji combining logic implemented** (`combine_cells_for_emoji()` exists and is correct)
+✅ **HarfBuzz shaping infrastructure** (Ready to accept multi-codepoint arrays once provided)
 
 ### Broken (Root Cause Identified - Fix Designed)
 
 🔴 **Multi-codepoint emoji sequences** (skin tones, flags, ZWJ sequences)
 
-- **Root cause**: `combine_cells_for_emoji()` exists but is NEVER CALLED
-- **Evidence**: Function at lines 107-216, no callers found
-- **Fix designed**: See "Multi-Codepoint Emoji Fix Design" section
-- **Status**: Ready to implement - just needs integration into render loop
+- **Root cause**: Renderer collects only from current cell; emoji helpers and combining function were removed in a git restore
+- **Evidence**: `src/renderer.c` contains single-cell collection at lines 439-444 and shaped path at 465; `cp_count` is always 1 for cross-cell emoji
+- **Fix designed**: Implement helpers and `combine_cells_for_emoji()` and integrate into render loop
+- **Status**: Ready to implement - requires adding code (~150 lines) and wiring
 
 🟡 **Complex vehicle emoji** (🚗🚕🚙 render as gray boxes)
 
@@ -886,7 +787,7 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ **Phase 3:** Renderer integration - Shaped runs rendering
 ✅ **Phase 4:** Critical coordinate system bug (Y-axis flip) - **FIXED**
 ✅ **Phase 5:** COLR v0 fallback verification - **VERIFIED**
-✅ **Phase 6:** Root cause analysis for emoji sequences - **COMPLETE**
+✅ **Phase 6:** Root cause analysis for emoji sequences - **COMPLETE** (removed code identified; fix designed requiring reimplementation)
 
 **Current State:**
 
@@ -898,13 +799,12 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 - ✅ Grayscale rendering for non-color glyphs
 - ✅ Y-axis coordinate mapping (layers positioned correctly)
 - ✅ HarfBuzz shaping infrastructure (ready for multi-codepoint)
-- ✅ Emoji combining function exists and is fully implemented
 
 **Broken (Fix Ready):**
 
-- 🔴 Skin tone modifiers: 👋🏻 → renders as 👋 + 🏻 (never calls combine function)
-- 🔴 Flag emoji: 🇺🇸 → renders as U + S (never calls combine function)
-- 🔴 ZWJ sequences: 👨‍👩‍👧‍👦 → individual people (never calls combine function)
+- 🔴 Skin tone modifiers: 👋🏻 → renders as 👋 + 🏻 (renderer lacks combining helpers)
+- 🔴 Flag emoji: 🇺🇸 → renders as U + S (renderer lacks combining helpers)
+- 🔴 ZWJ sequences: 👨‍👩‍👧‍👦 → individual people (renderer lacks combining helpers)
 - 🟡 Complex vehicle emoji: 🚗🚕🚙 → gray/white boxes (composite mode issue?)
 
 ## Next Steps (Priority Order)
@@ -912,12 +812,10 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ### Critical (Fix Designed and Ready)
 
 1. **Implement multi-codepoint cell combining integration** 🔴 **READY**
-   - Solution designed in detail above
+   - Implement emoji helpers and `combine_cells_for_emoji()` (~150 lines total) and wire into the render loop
    - Add skip tracking to row loop (1 line)
-   - Add skip check at start of column loop (3 lines)
-   - Replace codepoint collection with conditional combining (20 lines)
-   - Total change: ~25 lines in `src/renderer.c`
-   - **Location**: Lines 375-376, 598-603
+   - Replace single-cell collection with conditional combining logic (~30 lines)
+   - **Location**: `src/renderer.c` lines ~57 (helpers) and ~375-506 (integration)
    - **Test cases**: Prepared and ready
    - **Expected result**: All multi-codepoint emoji sequences render correctly
 
@@ -928,12 +826,12 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 
 ### Secondary (Correctness)
 
-3. **Implement missing composite modes** (COLOR_DODGE, HARD_LIGHT, etc.)
+3. **Implement missing composite modes** (COLOR_DODGE, HARD_LIGHT, SOFT_LIGHT, etc.)
 4. **Implement PaintExtend REPEAT/REFLECT**
 5. **Performance optimization** (GPU gradients, texture atlas)
 
 ---
 
-**Document Version:** 7.0  
-**Last Updated:** 2026-01-23  
-**Status:** Phase 6 Complete - Root Cause Identified - Fix Designed and Ready to Implement
+**Document Version:** 7.1
+**Last Updated:** 2026-01-23
+**Status:** Corrections applied — proposal updated to reflect that emoji combining code was removed and must be implemented; line numbers and scope have been corrected per LINE_NUMBER_CORRECTIONS.md
