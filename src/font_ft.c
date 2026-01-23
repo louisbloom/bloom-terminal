@@ -1097,11 +1097,118 @@ static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaqu
             }
             break;
         }
+        case FT_COLR_COMPOSITE_SCREEN:
+        {
+            // Screen: 1 - (1-src) * (1-back)
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                float sr = s[0] / 255.0f, sg = s[1] / 255.0f, sb = s[2] / 255.0f;
+                float br = b[0] / 255.0f, bg = b[1] / 255.0f, bb = b[2] / 255.0f;
+                float sa = s[3] / 255.0f, ba = b[3] / 255.0f;
+                float rr = 1.0f - (1.0f - sr) * (1.0f - br);
+                float rg = 1.0f - (1.0f - sg) * (1.0f - bg);
+                float rb = 1.0f - (1.0f - sb) * (1.0f - bb);
+                float outa = sa + ba * (1.0f - sa);
+                outa = outa <= 0.0f ? 0.0f : outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
+            break;
+        }
+        case FT_COLR_COMPOSITE_OVERLAY:
+        {
+            // Overlay: darken if back < 0.5, else lighten
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                float sr = s[0] / 255.0f, sg = s[1] / 255.0f, sb = s[2] / 255.0f;
+                float br = b[0] / 255.0f, bg = b[1] / 255.0f, bb = b[2] / 255.0f;
+                float sa = s[3] / 255.0f, ba = b[3] / 255.0f;
+                float rr = br < 0.5f ? 2.0f * sr * br : 1.0f - 2.0f * (1.0f - sr) * (1.0f - br);
+                float rg = bg < 0.5f ? 2.0f * sg * bg : 1.0f - 2.0f * (1.0f - sg) * (1.0f - bg);
+                float rb = bb < 0.5f ? 2.0f * sb * bb : 1.0f - 2.0f * (1.0f - sb) * (1.0f - bb);
+                float outa = sa + ba * (1.0f - sa);
+                outa = outa <= 0.0f ? 0.0f : outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
+            break;
+        }
+        case FT_COLR_COMPOSITE_DARKEN:
+        {
+            // Darken: min(src, back)
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                float sr = s[0] / 255.0f, sg = s[1] / 255.0f, sb = s[2] / 255.0f;
+                float br = b[0] / 255.0f, bg = b[1] / 255.0f, bb = b[2] / 255.0f;
+                float sa = s[3] / 255.0f, ba = b[3] / 255.0f;
+                float rr = sr < br ? sr : br;
+                float rg = sg < bg ? sg : bg;
+                float rb = sb < bb ? sb : bb;
+                float outa = sa + ba * (1.0f - sa);
+                outa = outa <= 0.0f ? 0.0f : outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
+            break;
+        }
+        case FT_COLR_COMPOSITE_LIGHTEN:
+        {
+            // Lighten: max(src, back)
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                float sr = s[0] / 255.0f, sg = s[1] / 255.0f, sb = s[2] / 255.0f;
+                float br = b[0] / 255.0f, bg = b[1] / 255.0f, bb = b[2] / 255.0f;
+                float sa = s[3] / 255.0f, ba = b[3] / 255.0f;
+                float rr = sr > br ? sr : br;
+                float rg = sg > bg ? sg : bg;
+                float rb = sb > bb ? sb : bb;
+                float outa = sa + ba * (1.0f - sa);
+                outa = outa <= 0.0f ? 0.0f : outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
+            break;
+        }
         default:
         {
-            // Fallback: copy source
-            for (int i = 0; i < w * h; i++)
-                memcpy(&buf[i * 4], &tmp_src[i * 4], 4);
+            // Fallback for unimplemented composite modes: use SRC_OVER
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                float sa = s[3] / 255.0f;
+                float ba = b[3] / 255.0f;
+                float outa = sa + ba * (1.0f - sa);
+                if (outa <= 0.0f) {
+                    dst[0] = dst[1] = dst[2] = dst[3] = 0;
+                    continue;
+                }
+                float sr = s[0] / 255.0f, sg = s[1] / 255.0f, sb = s[2] / 255.0f;
+                float br = b[0] / 255.0f, bg = b[1] / 255.0f, bb = b[2] / 255.0f;
+                float rr = (sr * sa + br * ba * (1.0f - sa)) / outa;
+                float rg = (sg * sa + bg * ba * (1.0f - sa)) / outa;
+                float rb = (sb * sa + bb * ba * (1.0f - sa)) / outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
             break;
         }
         }
