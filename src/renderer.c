@@ -57,17 +57,30 @@ static void convert_vterm_color_to_sdl(const VTermColor *vcol, Uint8 *r, Uint8 *
 }
 
 // Emoji helper functions
-static bool is_emoji_presentation(uint32_t cp)
+static bool is_emoji_base_range(uint32_t cp)
 {
-    // Basic emoji range checks
-    return (cp >= 0x2000 && cp <= 0x27FF) ||   // Miscellaneous Symbols
-           (cp >= 0x1F000 && cp <= 0x1F9FF) || // Supplemental Symbols and Pictographs
-           (cp >= 0xFE00 && cp <= 0xFE0F) ||   // Variation Selectors (for emoji variants)
-           (cp >= 0x1F300 && cp <= 0x1F5FF) || // Miscellaneous Symbols and Pictographs
+    // Proper emoji base ranges from Unicode standard
+    return (cp >= 0x1F300 && cp <= 0x1F5FF) || // Miscellaneous Symbols and Pictographs
            (cp >= 0x1F600 && cp <= 0x1F64F) || // Emoticons
            (cp >= 0x1F680 && cp <= 0x1F6FF) || // Transport and Map Symbols
            (cp >= 0x1F900 && cp <= 0x1F9FF) || // Supplemental Symbols and Pictographs
            (cp >= 0x1FA70 && cp <= 0x1FAFF);   // Symbols and Pictographs Extended-A
+}
+
+static bool is_ambiguous_emoji(uint32_t cp)
+{
+    // Characters that MIGHT be emoji with U+FE0F (text vs. emoji presentation)
+    return (cp >= 0x2600 && cp <= 0x27BF) ||
+           (cp >= 0x231A && cp <= 0x231B) ||   // Clock faces
+           (cp >= 0x1F600 && cp <= 0x1F64F) || // Emoticons
+           (cp >= 0x1F300 && cp <= 0x1F5FF) || // Miscellaneous Symbols and Pictographs
+           (cp >= 0x1F680 && cp <= 0x1F6FF);   // Transport and Map Symbols
+}
+
+static bool is_emoji_presentation(uint32_t cp)
+{
+    // Check if character is in emoji base ranges or ambiguous emoji that needs variation selector
+    return is_emoji_base_range(cp) || is_ambiguous_emoji(cp);
 }
 
 static bool is_regional_indicator(uint32_t cp)
@@ -91,7 +104,8 @@ static bool is_skin_tone_modifier(uint32_t cp)
 // Function to combine emoji cells for multi-codepoint sequences
 static int combine_cells_for_emoji(Terminal *term, int row, int col,
                                    uint32_t *combined_codepoints,
-                                   int max_combined)
+                                   int max_combined,
+                                   int *columns_consumed)
 {
     // Limit how far we look ahead to the same row
     int term_cols;
@@ -105,6 +119,7 @@ static int combine_cells_for_emoji(Terminal *term, int row, int col,
 
     // Start with what we already know - the first cell's content
     int current_cp_count = 0;
+    int total_columns_consumed = 0;
 
     // Collect all potentially combinable codepoints starting from this cell
     // We'll go forward as long as we can find emoji-compatible codepoints in subsequent cells
@@ -120,6 +135,8 @@ static int combine_cells_for_emoji(Terminal *term, int row, int col,
 
         // If this is an empty cell or has no characters, stop combining
         if (cell.chars[0] == 0) {
+            // Even if the cell is empty, we still need to account for its column width
+            total_columns_consumed += 1;
             break;
         }
 
@@ -135,26 +152,37 @@ static int combine_cells_for_emoji(Terminal *term, int row, int col,
             combined_codepoints[current_cp_count++] = cp;
         }
 
-        // Check if we should stop combining: for skin tone modifiers or regional indicators,
-        // we might want to continue combining the next cell(s)
-        // We'll only combine if the sequence looks like a valid emoji sequence
+        // Track columns consumed by this cell (consider its actual width)
+        total_columns_consumed += cell.width;
 
-        // If it's a ZWJ, we need to continue looking ahead for more emoji parts
-        if (current_cp_count > 0 && is_zwj(combined_codepoints[current_cp_count - 1])) {
-            // Continue accumulating more codepoints for ZWJ sequences
-            continue;
-        }
+        // Check if we should stop combining based on the NEXT cell
+        // This is the key fix from document 04: check the next cell content
+        // instead of last codepoint we collected
 
-        // If it's a skin tone modifier, we might want to combine with previous emoji
-        if (current_cp_count > 0 && is_skin_tone_modifier(combined_codepoints[current_cp_count - 1])) {
-            // Continue combining, but don't go over limits
-            continue;
-        }
-
-        // If it's a regional indicator, continue combining for flags
-        if (current_cp_count > 0 && is_regional_indicator(combined_codepoints[current_cp_count - 1])) {
-            // Continue combining
-            continue;
+        // Check if the next cell exists and has content
+        if (col + offset + 1 < term_cols) {
+            VTermScreenCell next_cell;
+            if (terminal_get_cell(term, row, col + offset + 1, &next_cell) == 0) {
+                uint32_t next_cp = next_cell.chars[0];
+                if (next_cp != 0) {
+                    // If the next cell has content, check if we should combine it
+                    if (is_zwj(next_cp)) {
+                        // Continue accumulating more codepoints for ZWJ sequences
+                        continue;
+                    }
+                    // If current cell's last codepoint is a skin tone modifier or regional indicator,
+                    // or we need to combine based on the next cell, continue combining
+                    if (current_cp_count > 0 && is_skin_tone_modifier(combined_codepoints[current_cp_count - 1])) {
+                        continue;
+                    }
+                    if (current_cp_count > 0 && is_regional_indicator(combined_codepoints[current_cp_count - 1])) {
+                        continue;
+                    }
+                }
+            }
+        } else {
+            // This is the last cell we check, we're not going to continue
+            break;
         }
     }
 
@@ -164,6 +192,9 @@ static int combine_cells_for_emoji(Terminal *term, int row, int col,
     }
 
     // Return number of codepoints that were combined
+    if (columns_consumed) {
+        *columns_consumed = total_columns_consumed;
+    }
     return current_cp_count;
 }
 
@@ -485,9 +516,15 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
     // Render each cell
     for (int row = 0; row < display_rows; row++) {
         int last_combined_col = -1; // Track cells consumed by emoji combining
+        int last_rendered_col = -1; // Track cells that were rendered (for skipping continuation cells)
         for (int col = 0; col < display_cols; col++) {
             // Skip cells that were already consumed by emoji combining logic
             if (col <= last_combined_col) {
+                continue;
+            }
+
+            // Also skip cells that have already been rendered as part of a multi-cell emoji sequence
+            if (col <= last_rendered_col) {
                 continue;
             }
 
@@ -565,13 +602,16 @@ void renderer_draw_terminal(Renderer *rend, Terminal *term)
                                            is_zwj(cell.chars[0]) ||
                                            is_skin_tone_modifier(cell.chars[0]))) {
                     // Try to combine cells for emoji sequences
+                    int columns_consumed = 0;
                     combined_cp_count = combine_cells_for_emoji(term, row, col, combined_cps,
-                                                                sizeof(combined_cps) / sizeof(combined_cps[0]));
+                                                                sizeof(combined_cps) / sizeof(combined_cps[0]),
+                                                                &columns_consumed);
 
                     // If we found multiple codepoints that can be combined, use them
                     if (combined_cp_count > 1) {
                         // Update the last_combined_col to skip the cells we consumed
-                        last_combined_col = col + combined_cp_count - 1;
+                        // Use columns_consumed instead of combined_cp_count for correct skip tracking
+                        last_combined_col = col + columns_consumed - 1;
 
                         // Use the combined codepoints
                         cp_count = combined_cp_count;
