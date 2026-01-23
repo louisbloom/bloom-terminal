@@ -11,6 +11,7 @@
 #include <fontconfig/fontconfig.h>
 #include <hb-ft.h>
 #include <hb.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -453,6 +454,755 @@ static GlyphBitmap *render_colr_glyph(FtFontData *ft_data, FT_UInt glyph_index,
     for (int i = 0; i < layer_count; i++)
         free(layers[i].bmp.buffer);
     free(layers);
+
+    return out;
+}
+
+// Helper: convert 16.16 fixed to double
+static double ft_fixed_to_double(FT_Fixed v)
+{
+    return (double)v / 65536.0;
+}
+
+// Helper: convert 26.6 fixed (FT_Pos) to double
+static double ft_pos_to_double(FT_Pos v)
+{
+    return (double)v / 64.0;
+}
+
+// Simple 2x3 affine matrix for transforms (row-major)
+typedef struct
+{
+    double xx, xy, dx;
+    double yx, yy, dy;
+} Affine;
+
+static void affine_identity(Affine *a)
+{
+    a->xx = 1.0;
+    a->xy = 0.0;
+    a->dx = 0.0;
+    a->yx = 0.0;
+    a->yy = 1.0;
+    a->dy = 0.0;
+}
+
+static void affine_from_FT_Affine23(Affine *out, const FT_Affine23 *in)
+{
+    if (!out || !in)
+        return;
+    out->xx = ft_fixed_to_double(in->xx);
+    out->xy = ft_fixed_to_double(in->xy);
+    out->dx = ft_fixed_to_double(in->dx);
+    out->yx = ft_fixed_to_double(in->yx);
+    out->yy = ft_fixed_to_double(in->yy);
+    out->dy = ft_fixed_to_double(in->dy);
+}
+
+static void affine_mul(Affine *out, const Affine *a, const Affine *b)
+{
+    // out = a * b
+    Affine r;
+    r.xx = a->xx * b->xx + a->xy * b->yx;
+    r.xy = a->xx * b->xy + a->xy * b->yy;
+    r.dx = a->xx * b->dx + a->xy * b->dy + a->dx;
+
+    r.yx = a->yx * b->xx + a->yy * b->yx;
+    r.yy = a->yx * b->xy + a->yy * b->yy;
+    r.dy = a->yx * b->dx + a->yy * b->dy + a->dy;
+
+    *out = r;
+}
+
+static void affine_apply(const Affine *a, double x, double y, double *rx, double *ry)
+{
+    if (!a) {
+        *rx = x;
+        *ry = y;
+        return;
+    }
+    *rx = x * a->xx + y * a->xy + a->dx;
+    *ry = x * a->yx + y * a->yy + a->dy;
+}
+
+// Rasterize glyph into single-channel alpha mask via FT_Get_Glyph + FT_Glyph_To_Bitmap
+static unsigned char *rasterize_glyph_mask(FtFontData *ft_data, FT_UInt glyph_index,
+                                           int *out_w, int *out_h, int *out_left, int *out_top)
+{
+    if (!ft_data || !ft_data->ft_face)
+        return NULL;
+    FT_Face face = ft_data->ft_face;
+
+    FT_Int32 load_flags = FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP;
+    if (!ft_data->hinting)
+        load_flags |= FT_LOAD_NO_HINTING;
+
+    FT_Error err = FT_Load_Glyph(face, glyph_index, load_flags);
+    if (err)
+        return NULL;
+
+    FT_Glyph glyph = NULL;
+    err = FT_Get_Glyph(face->glyph, &glyph);
+    if (err || !glyph)
+        return NULL;
+
+    // Convert glyph to bitmap (keeps hinting/size effects)
+    err = FT_Glyph_To_Bitmap(&glyph, ft_data->antialias ? FT_RENDER_MODE_NORMAL : FT_RENDER_MODE_MONO, NULL, 1);
+    if (err) {
+        FT_Done_Glyph(glyph);
+        return NULL;
+    }
+
+    FT_BitmapGlyph bmp_glyph = (FT_BitmapGlyph)glyph;
+    FT_Bitmap *bitmap = &bmp_glyph->bitmap;
+    int w = bitmap->width;
+    int h = bitmap->rows;
+    int left = bmp_glyph->left;
+    int top = bmp_glyph->top;
+
+    if (out_w)
+        *out_w = w;
+    if (out_h)
+        *out_h = h;
+    if (out_left)
+        *out_left = left;
+    if (out_top)
+        *out_top = top;
+    if (w <= 0 || h <= 0) {
+        FT_Done_Glyph(glyph);
+        return NULL;
+    }
+
+    unsigned char *mask = malloc((size_t)w * (size_t)h);
+    if (!mask) {
+        FT_Done_Glyph(glyph);
+        return NULL;
+    }
+
+    if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
+        for (int y = 0; y < h; y++)
+            memcpy(mask + y * w, bitmap->buffer + y * bitmap->pitch, w);
+    } else if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
+        for (int y = 0; y < h; y++) {
+            unsigned char *src = bitmap->buffer + y * bitmap->pitch;
+            for (int x = 0; x < w; x++) {
+                unsigned char byte = src[x >> 3];
+                unsigned char bit = (byte >> (7 - (x & 7))) & 1;
+                mask[y * w + x] = bit ? 255 : 0;
+            }
+        }
+    } else if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA) {
+        for (int y = 0; y < h; y++) {
+            unsigned char *src = bitmap->buffer + y * bitmap->pitch;
+            for (int x = 0; x < w; x++)
+                mask[y * w + x] = src[x * 4 + 3];
+        }
+    } else {
+        free(mask);
+        FT_Done_Glyph(glyph);
+        return NULL;
+    }
+
+    FT_Done_Glyph(glyph);
+    return mask;
+}
+
+// Resolve an FT_ColorIndex to RGBA (0..255)
+static void resolve_colorindex(FtFontData *ft_data, FT_ColorIndex ci, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b,
+                               uint8_t *out_r, uint8_t *out_g, uint8_t *out_b, uint8_t *out_a)
+{
+    // Default foreground
+    uint8_t pr = fg_r, pg = fg_g, pb = fg_b, pa = 255;
+    if (ci.palette_index == 0xFFFFu) {
+        // text foreground color
+        pr = fg_r;
+        pg = fg_g;
+        pb = fg_b;
+        pa = 255;
+    } else if (ft_data->palette && ci.palette_index < ft_data->palette_size) {
+        FT_Color c = ft_data->palette[ci.palette_index];
+        pr = c.red;
+        pg = c.green;
+        pb = c.blue;
+        pa = c.alpha;
+    }
+
+    // Apply alpha from FT_F2Dot14
+    double a_scale = 1.0;
+    if (ci.alpha) {
+        a_scale = (double)ci.alpha / (double)(1 << 14);
+        if (a_scale < 0.0)
+            a_scale = 0.0;
+        if (a_scale > 1.0)
+            a_scale = 1.0;
+    }
+
+    *out_r = pr;
+    *out_g = pg;
+    *out_b = pb;
+    *out_a = (uint8_t)round(pa * a_scale);
+}
+
+// Linear interpolation between two colors (RGBA 0..255)
+static void lerp_color(uint8_t *out, uint8_t a_r, uint8_t a_g, uint8_t a_b, uint8_t a_a,
+                       uint8_t b_r, uint8_t b_g, uint8_t b_b, uint8_t b_a, double t)
+{
+    if (t <= 0.0) {
+        out[0] = a_r;
+        out[1] = a_g;
+        out[2] = a_b;
+        out[3] = a_a;
+        return;
+    }
+    if (t >= 1.0) {
+        out[0] = b_r;
+        out[1] = b_g;
+        out[2] = b_b;
+        out[3] = b_a;
+        return;
+    }
+    out[0] = (uint8_t)round((1.0 - t) * a_r + t * b_r);
+    out[1] = (uint8_t)round((1.0 - t) * a_g + t * b_g);
+    out[2] = (uint8_t)round((1.0 - t) * a_b + t * b_b);
+    out[3] = (uint8_t)round((1.0 - t) * a_a + t * b_a);
+}
+
+// Evaluate colorline stops into an array of stops (small dynamic array)
+typedef struct
+{
+    double offset;
+    uint8_t r, g, b, a;
+} Stop;
+
+static Stop *eval_colorline(FtFontData *ft_data, FT_ColorLine *cline, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b, int *out_count)
+{
+    if (!cline || !out_count)
+        return NULL;
+    FT_ColorStopIterator it = cline->color_stop_iterator;
+    FT_ColorStop stop;
+    Stop *stops = NULL;
+    int count = 0;
+    while (FT_Get_Colorline_Stops(ft_data->ft_face, &stop, &it)) {
+        Stop *n = realloc(stops, sizeof(Stop) * (count + 1));
+        if (!n)
+            break;
+        stops = n;
+        uint8_t r, g, b, a;
+        resolve_colorindex(ft_data, stop.color, fg_r, fg_g, fg_b, &r, &g, &b, &a);
+        stops[count].offset = ft_fixed_to_double(stop.stop_offset); // 16.16 -> double
+        stops[count].r = r;
+        stops[count].g = g;
+        stops[count].b = b;
+        stops[count].a = a;
+        count++;
+    }
+    *out_count = count;
+    return stops;
+}
+
+// Paint a linear gradient into an RGBA buffer covering bbox (in pixels).
+// p0,p1,p2 are in FT 16.16 font units and will be transformed and scaled to pixel space.
+static void paint_linear_gradient(FtFontData *ft_data, FT_PaintLinearGradient *lg,
+                                  Affine *matrix, uint8_t *buf, int w, int h,
+                                  int dst_x_off, int dst_y_off, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    if (!ft_data || !lg || !buf)
+        return;
+
+    // Convert p0,p1 from 16.16 font-units to pixel space via ft_data->scale
+    double p0x = ft_fixed_to_double(lg->p0.x) * ft_data->scale;
+    double p0y = ft_fixed_to_double(lg->p0.y) * ft_data->scale;
+    double p1x = ft_fixed_to_double(lg->p1.x) * ft_data->scale;
+    double p1y = ft_fixed_to_double(lg->p1.y) * ft_data->scale;
+    // p2 optional used to rotate; for now ignore p2 (basic linear gradient)
+
+    // Apply affine transform if present
+    double tp0x, tp0y, tp1x, tp1y;
+    affine_apply(matrix, p0x, p0y, &tp0x, &tp0y);
+    affine_apply(matrix, p1x, p1y, &tp1x, &tp1y);
+
+    // Direction vector
+    double dx = tp1x - tp0x;
+    double dy = tp1y - tp0y;
+    double len2 = dx * dx + dy * dy;
+    if (len2 <= 1e-8)
+        len2 = 1e-8;
+
+    // Evaluate color stops
+    int stop_count = 0;
+    Stop *stops = eval_colorline(ft_data, &lg->colorline, fg_r, fg_g, fg_b, &stop_count);
+    if (!stops || stop_count == 0) {
+        if (stops)
+            free(stops);
+        return;
+    }
+
+    // For each pixel in bbox, compute projection t along gradient (normalized by distance between p0 and p1)
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            // pixel center coordinates in destination space
+            double px = (double)(x + dst_x_off);
+            double py = (double)(y + dst_y_off);
+            // vector from p0 to pixel
+            double vx = px - tp0x;
+            double vy = py - tp0y;
+            double t = (vx * dx + vy * dy) / len2; // can be <0 or >1
+
+            // Handle extend modes: only PAD for now
+            if (t < 0.0) {
+                t = 0.0;
+            }
+            if (t > 1.0) {
+                t = 1.0;
+            }
+
+            // Find stops surrounding t
+            int idx = 0;
+            while (idx < stop_count && stops[idx].offset < t)
+                idx++;
+            uint8_t outc[4] = { 0, 0, 0, 0 };
+            if (idx == 0) {
+                outc[0] = stops[0].r;
+                outc[1] = stops[0].g;
+                outc[2] = stops[0].b;
+                outc[3] = stops[0].a;
+            } else if (idx >= stop_count) {
+                outc[0] = stops[stop_count - 1].r;
+                outc[1] = stops[stop_count - 1].g;
+                outc[2] = stops[stop_count - 1].b;
+                outc[3] = stops[stop_count - 1].a;
+            } else {
+                double t0 = stops[idx - 1].offset;
+                double t1 = stops[idx].offset;
+                double local = (t1 - t0) == 0.0 ? 0.0 : (t - t0) / (t1 - t0);
+                lerp_color(outc, stops[idx - 1].r, stops[idx - 1].g, stops[idx - 1].b, stops[idx - 1].a,
+                           stops[idx].r, stops[idx].g, stops[idx].b, stops[idx].a, local);
+            }
+
+            uint8_t *pixel = buf + (y * w + x) * 4;
+            pixel[0] = outc[0];
+            pixel[1] = outc[1];
+            pixel[2] = outc[2];
+            pixel[3] = outc[3];
+        }
+    }
+
+    free(stops);
+}
+
+static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_index, uint8_t fg_r, uint8_t fg_g, uint8_t fg_b);
+
+// Recursive paint evaluator for FT_COLR v1 paints. This function paints into `buf` (RGBA) of size w*h
+// with an origin offset (dst_x_off,dst_y_off) applied to gradient coordinate space. The `opaque` argument
+// references the paint table to evaluate.
+static bool paint_colr_paint_recursive(FtFontData *ft_data, FT_OpaquePaint opaque, Affine *matrix,
+                                       uint8_t *buf, int w, int h, int dst_x_off, int dst_y_off,
+                                       uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    if (!ft_data || !buf)
+        return false;
+
+    FT_COLR_Paint paint;
+    if (!FT_Get_Paint(ft_data->ft_face, opaque, &paint))
+        return false;
+
+    switch (paint.format) {
+    case FT_COLR_PAINTFORMAT_SOLID:
+    {
+        uint8_t r, g, b, a;
+        resolve_colorindex(ft_data, paint.u.solid.color, fg_r, fg_g, fg_b, &r, &g, &b, &a);
+        for (int i = 0; i < w * h; i++) {
+            buf[i * 4 + 0] = r;
+            buf[i * 4 + 1] = g;
+            buf[i * 4 + 2] = b;
+            buf[i * 4 + 3] = a;
+        }
+        return true;
+    }
+    case FT_COLR_PAINTFORMAT_LINEAR_GRADIENT:
+    {
+        paint_linear_gradient(ft_data, &paint.u.linear_gradient, matrix, buf, w, h, dst_x_off, dst_y_off, fg_r, fg_g, fg_b);
+        return true;
+    }
+    case FT_COLR_PAINTFORMAT_RADIAL_GRADIENT:
+    {
+        // Radial gradient implementation
+        FT_PaintRadialGradient *rg = &paint.u.radial_gradient;
+        // Convert centers and radii from 16.16 to pixel space and apply affine
+        double c0x = ft_fixed_to_double(rg->c0.x) * ft_data->scale;
+        double c0y = ft_fixed_to_double(rg->c0.y) * ft_data->scale;
+        double c1x = ft_fixed_to_double(rg->c1.x) * ft_data->scale;
+        double c1y = ft_fixed_to_double(rg->c1.y) * ft_data->scale;
+        double r0 = ft_fixed_to_double(rg->r0) * ft_data->scale;
+        double r1 = ft_fixed_to_double(rg->r1) * ft_data->scale;
+
+        double tc0x, tc0y, tc1x, tc1y;
+        affine_apply(matrix, c0x, c0y, &tc0x, &tc0y);
+        affine_apply(matrix, c1x, c1y, &tc1x, &tc1y);
+
+        int stop_count = 0;
+        Stop *stops = eval_colorline(ft_data, &rg->colorline, fg_r, fg_g, fg_b, &stop_count);
+        if (!stops || stop_count == 0) {
+            if (stops)
+                free(stops);
+            return false;
+        }
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                double px = (double)(x + dst_x_off);
+                double py = (double)(y + dst_y_off);
+                // distance to c0
+                double d = hypot(px - tc0x, py - tc0y);
+                double denom = (r1 - r0);
+                double t = denom == 0.0 ? 0.0 : (d - r0) / denom;
+                if (t < 0.0) {
+                    t = 0.0;
+                }
+                if (t > 1.0) {
+                    t = 1.0;
+                }
+
+                int idx = 0;
+                while (idx < stop_count && stops[idx].offset < t)
+                    idx++;
+                uint8_t outc[4];
+                if (idx == 0) {
+                    outc[0] = stops[0].r;
+                    outc[1] = stops[0].g;
+                    outc[2] = stops[0].b;
+                    outc[3] = stops[0].a;
+                } else if (idx >= stop_count) {
+                    outc[0] = stops[stop_count - 1].r;
+                    outc[1] = stops[stop_count - 1].g;
+                    outc[2] = stops[stop_count - 1].b;
+                    outc[3] = stops[stop_count - 1].a;
+                } else {
+                    double t0 = stops[idx - 1].offset;
+                    double t1 = stops[idx].offset;
+                    double local = (t1 - t0) == 0.0 ? 0.0 : (t - t0) / (t1 - t0);
+                    lerp_color(outc, stops[idx - 1].r, stops[idx - 1].g, stops[idx - 1].b, stops[idx - 1].a,
+                               stops[idx].r, stops[idx].g, stops[idx].b, stops[idx].a, local);
+                }
+                uint8_t *pixel = buf + (y * w + x) * 4;
+                pixel[0] = outc[0];
+                pixel[1] = outc[1];
+                pixel[2] = outc[2];
+                pixel[3] = outc[3];
+            }
+        }
+        free(stops);
+        return true;
+    }
+    case FT_COLR_PAINTFORMAT_SWEEP_GRADIENT:
+    {
+        // Sweep gradient implementation
+        FT_PaintSweepGradient *sg = &paint.u.sweep_gradient;
+        double cx = ft_fixed_to_double(sg->center.x) * ft_data->scale;
+        double cy = ft_fixed_to_double(sg->center.y) * ft_data->scale;
+        double tcx, tcy;
+        affine_apply(matrix, cx, cy, &tcx, &tcy);
+
+        double start_deg = ft_fixed_to_double(sg->start_angle) * 180.0;
+        double end_deg = ft_fixed_to_double(sg->end_angle) * 180.0;
+
+        int stop_count = 0;
+        Stop *stops = eval_colorline(ft_data, &sg->colorline, fg_r, fg_g, fg_b, &stop_count);
+        if (!stops || stop_count == 0) {
+            if (stops)
+                free(stops);
+            return false;
+        }
+
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                double px = (double)(x + dst_x_off);
+                double py = (double)(y + dst_y_off);
+                double vx = px - tcx;
+                double vy = py - tcy;
+                // compute angle in degrees measured counter-clockwise from positive y axis
+                double ang_rad = atan2(vx, vy); // swap to get from positive y
+                double ang_deg = ang_rad * (180.0 / M_PI);
+                if (ang_deg < 0)
+                    ang_deg += 360.0;
+
+                // Normalize between start_deg and end_deg
+                double total = end_deg - start_deg;
+                if (total < 0)
+                    total += 360.0;
+                double rel = ang_deg - start_deg;
+                if (rel < 0)
+                    rel += 360.0;
+                double t = total == 0.0 ? 0.0 : rel / total;
+                if (t < 0.0) {
+                    t = 0.0;
+                }
+                if (t > 1.0) {
+                    t = 1.0;
+                }
+
+                int idx = 0;
+                while (idx < stop_count && stops[idx].offset < t)
+                    idx++;
+                uint8_t outc[4];
+                if (idx == 0) {
+                    outc[0] = stops[0].r;
+                    outc[1] = stops[0].g;
+                    outc[2] = stops[0].b;
+                    outc[3] = stops[0].a;
+                } else if (idx >= stop_count) {
+                    outc[0] = stops[stop_count - 1].r;
+                    outc[1] = stops[stop_count - 1].g;
+                    outc[2] = stops[stop_count - 1].b;
+                    outc[3] = stops[stop_count - 1].a;
+                } else {
+                    double t0 = stops[idx - 1].offset;
+                    double t1 = stops[idx].offset;
+                    double local = (t1 - t0) == 0.0 ? 0.0 : (t - t0) / (t1 - t0);
+                    lerp_color(outc, stops[idx - 1].r, stops[idx - 1].g, stops[idx - 1].b, stops[idx - 1].a,
+                               stops[idx].r, stops[idx].g, stops[idx].b, stops[idx].a, local);
+                }
+                uint8_t *pixel = buf + (y * w + x) * 4;
+                pixel[0] = outc[0];
+                pixel[1] = outc[1];
+                pixel[2] = outc[2];
+                pixel[3] = outc[3];
+            }
+        }
+        free(stops);
+        return true;
+    }
+    case FT_COLR_PAINTFORMAT_COMPOSITE:
+    {
+        FT_PaintComposite *pc = &paint.u.composite;
+        uint8_t *tmp_back = calloc((size_t)w * (size_t)h, 4);
+        uint8_t *tmp_src = calloc((size_t)w * (size_t)h, 4);
+        if (!tmp_back || !tmp_src) {
+            if (tmp_back)
+                free(tmp_back);
+            if (tmp_src)
+                free(tmp_src);
+            return false;
+        }
+
+        // Evaluate backdrop and source paints into temporary buffers
+        paint_colr_paint_recursive(ft_data, pc->backdrop_paint, matrix, tmp_back, w, h, dst_x_off, dst_y_off, fg_r, fg_g, fg_b);
+        paint_colr_paint_recursive(ft_data, pc->source_paint, matrix, tmp_src, w, h, dst_x_off, dst_y_off, fg_r, fg_g, fg_b);
+
+        switch (pc->composite_mode) {
+        case FT_COLR_COMPOSITE_SRC_OVER:
+        {
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *src = &tmp_src[i * 4];
+                uint8_t *back = &tmp_back[i * 4];
+                float sa = src[3] / 255.0f;
+                float ba = back[3] / 255.0f;
+                float outa = sa + ba * (1.0f - sa);
+                if (outa <= 0.0f) {
+                    dst[0] = dst[1] = dst[2] = dst[3] = 0;
+                    continue;
+                }
+                float sr = src[0] / 255.0f, sg = src[1] / 255.0f, sb = src[2] / 255.0f;
+                float br = back[0] / 255.0f, bg = back[1] / 255.0f, bb = back[2] / 255.0f;
+                float rr = (sr * sa + br * ba * (1.0f - sa)) / outa;
+                float rg = (sg * sa + bg * ba * (1.0f - sa)) / outa;
+                float rb = (sb * sa + bb * ba * (1.0f - sa)) / outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
+            break;
+        }
+        case FT_COLR_COMPOSITE_PLUS:
+        {
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                int r = s[0] + b[0];
+                int g = s[1] + b[1];
+                int bl = s[2] + b[2];
+                int a = s[3] + b[3];
+                dst[0] = (uint8_t)(r > 255 ? 255 : r);
+                dst[1] = (uint8_t)(g > 255 ? 255 : g);
+                dst[2] = (uint8_t)(bl > 255 ? 255 : bl);
+                dst[3] = (uint8_t)(a > 255 ? 255 : a);
+            }
+            break;
+        }
+        case FT_COLR_COMPOSITE_MULTIPLY:
+        {
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *dst = &buf[i * 4];
+                uint8_t *s = &tmp_src[i * 4];
+                uint8_t *b = &tmp_back[i * 4];
+                float sr = s[0] / 255.0f, sg = s[1] / 255.0f, sb = s[2] / 255.0f;
+                float br = b[0] / 255.0f, bg = b[1] / 255.0f, bb = b[2] / 255.0f;
+                float rr = sr * br;
+                float rg = sg * bg;
+                float rb = sb * bb;
+                float a = s[3] / 255.0f + b[3] / 255.0f * (1.0f - s[3] / 255.0f);
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(a * 255.0f);
+            }
+            break;
+        }
+        default:
+        {
+            // Fallback: copy source
+            for (int i = 0; i < w * h; i++)
+                memcpy(&buf[i * 4], &tmp_src[i * 4], 4);
+            break;
+        }
+        }
+        free(tmp_back);
+        free(tmp_src);
+        return true;
+    }
+    case FT_COLR_PAINTFORMAT_TRANSFORM:
+    {
+        FT_OpaquePaint child = paint.u.transform.paint;
+        Affine local;
+        affine_from_FT_Affine23(&local, &paint.u.transform.affine);
+        Affine next;
+        affine_mul(&next, matrix, &local);
+        return paint_colr_paint_recursive(ft_data, child, &next, buf, w, h, dst_x_off, dst_y_off, fg_r, fg_g, fg_b);
+    }
+    case FT_COLR_PAINTFORMAT_GLYPH:
+    {
+        FT_PaintGlyph *pg = &paint.u.glyph;
+        int mw = 0, mh = 0, left = 0, top = 0;
+        unsigned char *mask = rasterize_glyph_mask(ft_data, (FT_UInt)pg->glyphID, &mw, &mh, &left, &top);
+        if (!mask)
+            return false;
+
+        uint8_t *tmp = calloc((size_t)mw * (size_t)mh, 4);
+        if (!tmp) {
+            free(mask);
+            return false;
+        }
+
+        FT_OpaquePaint child = pg->paint;
+        paint_colr_paint_recursive(ft_data, child, matrix, tmp, mw, mh, left + dst_x_off, (top - mh) + dst_y_off, fg_r, fg_g, fg_b);
+
+        for (int y = 0; y < mh; y++) {
+            for (int x = 0; x < mw; x++) {
+                uint8_t mask_a = mask[y * mw + x];
+                if (mask_a == 0)
+                    continue;
+                int dst_x = left + x - dst_x_off;
+                int dst_y = (top - mh) + y - dst_y_off;
+                if (dst_x < 0 || dst_x >= w || dst_y < 0 || dst_y >= h)
+                    continue;
+
+                uint8_t *dst = &buf[(dst_y * w + dst_x) * 4];
+                uint8_t *src = &tmp[(y * mw + x) * 4];
+
+                float sa = (mask_a / 255.0f) * (src[3] / 255.0f);
+                float da = dst[3] / 255.0f;
+                float outa = sa + da * (1.0f - sa);
+                if (outa <= 0.0f)
+                    continue;
+                float sr = src[0] / 255.0f, sg = src[1] / 255.0f, sb = src[2] / 255.0f;
+                float dr = dst[0] / 255.0f, dg = dst[1] / 255.0f, db = dst[2] / 255.0f;
+                float rr = (sr * sa + dr * da * (1.0f - sa)) / outa;
+                float rg = (sg * sa + dg * da * (1.0f - sa)) / outa;
+                float rb = (sb * sa + db * da * (1.0f - sa)) / outa;
+                dst[0] = (uint8_t)round(rr * 255.0f);
+                dst[1] = (uint8_t)round(rg * 255.0f);
+                dst[2] = (uint8_t)round(rb * 255.0f);
+                dst[3] = (uint8_t)round(outa * 255.0f);
+            }
+        }
+
+        free(mask);
+        free(tmp);
+        return true;
+    }
+    default:
+        // Unsupported paint types fall back to solid transparent
+        for (int i = 0; i < w * h; i++) {
+            buf[i * 4 + 0] = 0;
+            buf[i * 4 + 1] = 0;
+            buf[i * 4 + 2] = 0;
+            buf[i * 4 + 3] = 0;
+        }
+        return false;
+    }
+}
+
+// Render COLR v1 paint for a glyph id into an RGBA bitmap using FT_Get_Color_Glyph_Paint
+static GlyphBitmap *render_colr_paint_glyph(FtFontData *ft_data, FT_UInt glyph_index,
+                                            uint8_t fg_r, uint8_t fg_g, uint8_t fg_b)
+{
+    if (!ft_data || !ft_data->ft_face)
+        return NULL;
+
+    FT_OpaquePaint root = { NULL, 0 };
+    if (!FT_Get_Color_Glyph_Paint(ft_data->ft_face, glyph_index, FT_COLOR_INCLUDE_ROOT_TRANSFORM, &root))
+        return NULL;
+
+    // Get root paint
+    FT_COLR_Paint root_paint;
+    if (!FT_Get_Paint(ft_data->ft_face, root, &root_paint))
+        return NULL;
+
+    // Determine bounding box for glyph using FT_Get_Color_Glyph_ClipBox if available
+    FT_ClipBox clip;
+    int have_clip = FT_Get_Color_Glyph_ClipBox(ft_data->ft_face, glyph_index, &clip);
+    int out_w = 0, out_h = 0, xoff = 0, yoff = 0;
+    if (have_clip) {
+        // clip coordinates are in 26.6 fixed; convert to pixels
+        double blx = ft_pos_to_double(clip.bottom_left.x);
+        double bly = ft_pos_to_double(clip.bottom_left.y);
+        double trx = ft_pos_to_double(clip.top_right.x);
+        double try_ = ft_pos_to_double(clip.top_right.y);
+        xoff = (int)floor(blx * ft_data->scale);
+        yoff = (int)ceil(try_ * ft_data->scale);
+        out_w = (int)ceil((trx - blx) * ft_data->scale);
+        out_h = (int)ceil((try_ - bly) * ft_data->scale);
+        if (out_w <= 0 || out_h <= 0)
+            return NULL;
+    } else {
+        // Fallback to rasterizing a simple monochrome glyph to determine bbox
+        GlyphBitmap *gb = rasterize_glyph_index(ft_data, glyph_index, 255, 255, 255);
+        if (!gb)
+            return NULL;
+        out_w = gb->width;
+        out_h = gb->height;
+        xoff = gb->x_offset;
+        yoff = gb->y_offset;
+        if (gb->pixels)
+            free(gb->pixels);
+        free(gb);
+        if (out_w <= 0 || out_h <= 0)
+            return NULL;
+    }
+
+    GlyphBitmap *out = malloc(sizeof(GlyphBitmap));
+    if (!out)
+        return NULL;
+    out->width = out_w;
+    out->height = out_h;
+    out->x_offset = xoff;
+    out->y_offset = yoff;
+    out->advance = 0;
+    out->glyph_id = glyph_index;
+    out->pixels = calloc(out_w * out_h, 4);
+    if (!out->pixels) {
+        free(out);
+        return NULL;
+    }
+
+    Affine identity;
+    affine_identity(&identity);
+
+    // Evaluate root paint into out->pixels
+    paint_colr_paint_recursive(ft_data, root, &identity, out->pixels, out_w, out_h, 0, 0, fg_r, fg_g, fg_b);
 
     return out;
 }
@@ -931,6 +1681,11 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
 
     // Handle COLR color glyphs if supported (best-effort)
     if (ft_data->has_colr && FT_HAS_COLOR(ft_data->ft_face)) {
+        // Try COLR v1 paint graph rendering first
+        GlyphBitmap *colr_p = render_colr_paint_glyph(ft_data, glyph_index, fg_r, fg_g, fg_b);
+        if (colr_p)
+            return colr_p;
+        // Fallback to COLR v0 layer rendering
         GlyphBitmap *colr = render_colr_glyph(ft_data, glyph_index, fg_r, fg_g, fg_b);
         if (colr)
             return colr;
