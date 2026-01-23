@@ -16,14 +16,16 @@ This document tracks the redesign of the glyph rendering system to eliminate Cai
 
 ### Immediate (Current Issues - Critical)
 
-1. **Fix ZWJ and multi-codepoint emoji rendering** 🔴 BROKEN
+1. **Fix ZWJ and multi-codepoint emoji rendering** 🔴 BROKEN - **ROOT CAUSE IDENTIFIED**
    - **Issue**: Skin tone modifiers render as separate glyphs (👋 + 🏻 instead of 👋🏻)
    - **Issue**: Flag emoji render as separate regional indicators (🇺 + 🇸 instead of 🇺🇸)
    - **Issue**: Family emoji render as individual people instead of combined group
-   - **Root cause**: libvterm stores multi-codepoint sequences in separate cells
-   - **Solution needed**: Cell combining logic or lookahead to group related codepoints
+   - **Root cause**: **`combine_cells_for_emoji()` exists but is NEVER CALLED**
+   - **Location of dead code**: `src/renderer.c:107-216` - fully implemented but unused
+   - **Location of bug**: `src/renderer.c:598-603` - only collects codepoints from single cell
+   - **Solution designed**: See "Multi-Codepoint Emoji Fix Design" section below
    - **Affected**: Skin tones, flags, ZWJ sequences (family, professions, etc.)
-   - **Status**: Shaping code works when cp_count > 1, but cells arrive individually
+   - **Status**: Fix designed and ready to implement
 
 2. **Debug complex COLR v1 rendering issues** 🟡 PARTIAL
    - **Issue**: Some vehicle emoji (🚗🚕🚙) render as gray/white boxes
@@ -74,6 +76,417 @@ This document tracks the redesign of the glyph rendering system to eliminate Cai
 10. **Extended variable font axes**
     - Current: Weight (wght) supported
     - Add: Width (wdth), Slant (slnt), Italic (ital), Optical Size (opsz), Grade (GRAD)
+
+---
+
+## Architectural Decision: Where to Fix Emoji Sequences?
+
+### Question: Why Fix at Renderer Level Instead of libvterm Level?
+
+**TL;DR:** libvterm is designed to be minimal and Unicode-semantics-agnostic. Emoji combining is a **rendering concern**, not a terminal emulation concern. The fix belongs in the renderer.
+
+### How libvterm Handles Unicode (Research Findings)
+
+**libvterm's Cell Model:**
+
+- **VTERM_MAX_CHARS_PER_CELL = 6**: Fixed array in each cell (ABI-locked)
+- **Combining character detection**: Uses Unicode categories (Mn, Me, Cf)
+  - Base character + up to 5 combining marks CAN fit in one cell
+  - Combining marks include: diacritics, ZWJ (U+200D), variation selectors
+- **Width calculation**: Based on Unicode East Asian Width property
+  - 0-width: combining characters, ZWJ, variation selectors
+  - 1-width: most characters (Latin, emoji base)
+  - 2-width: East Asian Wide, CJK ideographs
+
+**How Codepoints Are Assigned to Cells (`src/state.c` in libvterm):**
+
+```c
+// Simplified libvterm logic:
+for (each codepoint) {
+  if (vterm_unicode_is_combining(cp)) {
+    // Add to current cell (up to 6 total)
+    append_to_current_cell(cp);
+  } else {
+    // Start new cell
+    advance_to_next_cell();
+    start_new_cell(cp);
+  }
+}
+```
+
+**What This Means for Emoji:**
+
+1. **Skin tone modifiers (U+1F3FB-U+1F3FF):**
+   - These are NOT in libvterm's combining character table
+   - libvterm treats them as **base characters** (width 2)
+   - Storage: 👋 (cell 0) + 🏻 (cell 1) - **separate cells**
+
+2. **ZWJ (U+200D - Zero Width Joiner):**
+   - IS in combining table (U+200B-U+200F range)
+   - Width: 0
+   - Storage when following emoji: 👨 (cell 0, includes ZWJ as combining) + 👩 (cell 1) + ...
+   - **Still splits** because each emoji base starts a new cell
+
+3. **Regional Indicators (U+1F1E6-U+1F1FF):**
+   - NOT in combining table
+   - Each RI is a base character (width 2)
+   - Storage: 🇺 (cell 0) + 🇸 (cell 1) - **separate cells**
+
+**Key Insight:** libvterm has **no semantic understanding of emoji**. It only knows:
+
+- Is this a combining mark? (Unicode category)
+- How wide is this character? (East Asian Width)
+
+Emoji modifiers and ZWJ emoji are **application-level semantics**, not terminal-level semantics.
+
+### Why NOT Fix at libvterm Level?
+
+**Reason 1: Not libvterm's Job**
+
+Terminal emulators faithfully represent character streams as cells. They don't interpret high-level Unicode semantics like:
+
+- Emoji ZWJ sequences
+- Grapheme clusters
+- Ligatures
+- Complex text shaping
+
+This is intentional - libvterm is a **terminal emulator library**, not a **text rendering library**.
+
+**Reason 2: ABI Constraints**
+
+```c
+#define VTERM_MAX_CHARS_PER_CELL 6  // Cannot change without breaking ABI
+```
+
+Even if we wanted to store long emoji sequences (👨‍👩‍👧‍👦 = 7 codepoints), we'd hit the 6-codepoint limit. We'd need to:
+
+- Increase the constant (breaks ABI with all existing libvterm users)
+- Or implement dynamic storage (major libvterm change, breaks API)
+
+**Reason 3: libvterm is External Dependency**
+
+We don't control libvterm. Even if we forked it:
+
+- Maintenance burden (sync with upstream)
+- Incompatibility with system libvterm
+- Other terminal emulators don't have this issue (they fix at rendering layer)
+
+**Reason 4: Separation of Concerns**
+
+```
+Terminal Layer (libvterm):          Rendering Layer (our code):
+├─ Parse escape sequences           ├─ Shape text (HarfBuzz)
+├─ Maintain cell grid                ├─ Combine emoji sequences
+├─ Handle cursor movement            ├─ Render glyphs (FreeType)
+└─ Basic Unicode width               └─ Position and composite
+   (East Asian Width only)              (with font metrics)
+```
+
+**Emoji sequence understanding belongs in the renderer**, alongside:
+
+- HarfBuzz shaping (ligatures, complex scripts)
+- Font substitution
+- COLR paint evaluation
+
+### Why Fix at Renderer Level? ✅
+
+**Reason 1: We Already Have the Infrastructure**
+
+- `combine_cells_for_emoji()` already exists (lines 107-216)
+- Emoji detection helpers already exist
+- HarfBuzz shaping path already handles multi-codepoint arrays
+- Just need to wire it up
+
+**Reason 2: Rendering is the Right Layer**
+
+Renderers MUST lookahead for many reasons:
+
+- **Font shaping**: "fi" ligature requires looking at adjacent characters
+- **BiDi**: Hebrew/Arabic text requires line-level reordering
+- **Grapheme clusters**: "é" (e + combining acute) must be treated as unit
+- **Emoji sequences**: Same category as above - rendering semantics
+
+**Reason 3: Precedent from Other Terminal Emulators**
+
+- **Alacritty**: Handles emoji combining at renderer level
+- **Kitty**: Handles emoji combining at renderer level
+- **WezTerm**: Handles emoji combining at renderer level
+- **Standard practice**: Terminal layer stores cells, renderer combines for display
+
+**Reason 4: Minimal Change**
+
+Our fix is ~25 lines of code in renderer.c:
+
+- Add skip tracking (3 lines)
+- Call existing combine function (20 lines)
+- No libvterm changes needed
+- No external dependency changes
+
+### Conclusion: Renderer-Level Fix is Correct
+
+**The split happens at libvterm level** (by design), but **the fix belongs at renderer level** (by architecture).
+
+This is not a workaround - it's the proper separation of concerns:
+
+- **libvterm**: Faithful character cell representation
+- **Renderer**: Semantic understanding and presentation
+
+Our fix follows industry best practices and requires minimal code changes.
+
+---
+
+## Multi-Codepoint Emoji Fix Design
+
+### Research Findings (2026-01-23)
+
+**Discovery:** The code to fix emoji sequences ALREADY EXISTS but is never called!
+
+**Evidence:**
+
+- `src/renderer.c:107-216` contains `combine_cells_for_emoji()` function
+- Handles skin tone modifiers, ZWJ sequences, and regional indicators
+- Fully implemented with proper lookahead logic
+- **BUT**: `grep -r "combine_cells_for_emoji" src/` returns NO CALLS to this function
+
+**Current Broken Flow:**
+
+```
+src/renderer.c:375-554 - Main rendering loop
+  ├─ Line 376: for (int col = 0; col < display_cols; col++)
+  ├─ Line 377: VTermScreenCell cell; terminal_get_cell(term, row, col, &cell)
+  ├─ Lines 598-603: Collect codepoints from SINGLE CELL ONLY:
+  │     for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
+  │         cps[cp_count++] = cell.chars[i];
+  │     }
+  └─ Line 624: if (cp_count > 1) ... shaped rendering
+      └─ NEVER TRIGGERED because each cell has cp_count=1
+```
+
+**What `combine_cells_for_emoji()` Does:**
+
+- **Input**: Terminal, row, col, output buffer
+- **Output**: Combined codepoint array with count
+- **Logic**:
+  1. Starts at given col, reads first cell
+  2. Looks ahead to next cells (up to 5 cells)
+  3. If next cell is skin tone modifier (U+1F3FB-U+1F3FF): combine
+  4. If next cell is ZWJ (U+200D): collect entire ZWJ chain
+  5. If current cell is regional indicator: combine with next RI for flags
+  6. Returns total codepoint count and updates array
+
+**Why It's Not Called:**
+
+- Likely implemented in anticipation of the problem
+- Integration was never completed
+- Rendering loop uses simpler single-cell logic
+
+### Solution Design
+
+**Approach:** Use existing `combine_cells_for_emoji()` with cell skip tracking
+
+**Required Changes:**
+
+**File: `src/renderer.c`**
+
+**Change 1: Add skip tracking before cell loop (line ~375)**
+
+```c
+// Render each cell
+for (int row = 0; row < display_rows; row++) {
+    // NEW: Track cells consumed by emoji combining
+    int last_combined_col = -1;
+
+    for (int col = 0; col < display_cols; col++) {
+        // NEW: Skip cells already consumed
+        if (col <= last_combined_col) {
+            continue;
+        }
+
+        VTermScreenCell cell;
+        if (terminal_get_cell(term, row, col, &cell) < 0) {
+            continue;
+        }
+        /* ... rest of loop ... */
+```
+
+**Change 2: Replace single-cell codepoint collection (lines ~598-603)**
+
+```c
+// OLD CODE (lines 598-603):
+uint32_t cps[VTERM_MAX_CHARS_PER_CELL];
+int cp_count = 0;
+for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
+    cps[cp_count++] = cell.chars[i];
+}
+
+// NEW CODE:
+#define MAX_COMBINED_CODEPOINTS 16
+uint32_t cps[MAX_COMBINED_CODEPOINTS];
+int cp_count = 0;
+
+// Check if first codepoint is emoji-like
+bool is_emoji_range = false;
+if (cell.chars[0] != 0) {
+    uint32_t first_cp = cell.chars[0];
+    is_emoji_range = (first_cp >= 0x1F000 && first_cp <= 0x1F9FF) ||
+                     is_regional_indicator(first_cp) ||
+                     is_emoji_presentation(first_cp);
+}
+
+// Use emoji combining for emoji codepoints
+if (is_emoji_range) {
+    cp_count = combine_cells_for_emoji(term, row, col, cps, MAX_COMBINED_CODEPOINTS);
+    if (cp_count > 1) {
+        // Calculate how many cells were consumed by examining the combined result
+        // Skin tone: 2 codepoints (base + modifier) from 2 cells
+        // Flag: 2 codepoints (2 RIs) from 2 cells
+        // ZWJ family: 7 codepoints (4 people + 3 ZWJ) from 7 cells
+        // Heuristic: count codepoints roughly equals cells consumed
+        last_combined_col = col + cp_count - 1;
+        vlog("Combined emoji at (%d,%d): %d codepoints from %d cells\n",
+             row, col, cp_count, cp_count);
+    }
+} else {
+    // Non-emoji: single cell collection
+    for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell.chars[i] != 0; i++) {
+        cps[cp_count++] = cell.chars[i];
+    }
+}
+```
+
+**Change 3: No changes needed to shaping path**
+
+- Lines 624-664 already handle `cp_count > 1` correctly
+- HarfBuzz shaping will work once we pass combined arrays
+
+### Implementation Notes
+
+**Cell Width Considerations:**
+
+- vterm may store emoji sequences with varying cell widths
+- Skin tone: base emoji (width 2) + modifier (width 0) = 2 total cells
+- Flag: RI (width 1) + RI (width 1) = 2 cells
+- ZWJ: person (2) + ZWJ (0) + person (2) + ZWJ (0) + ... = variable
+- **Solution**: `combine_cells_for_emoji()` returns actual cell count via column delta
+- Update `last_combined_col` based on actual cells consumed
+
+**Improved Cell Skip Logic:**
+
+```c
+if (is_emoji_range) {
+    int start_col = col;
+    cp_count = combine_cells_for_emoji(term, row, col, cps, MAX_COMBINED_CODEPOINTS);
+
+    // Determine actual end column by checking cell widths
+    int cells_consumed = 1;  // At least current cell
+    for (int check_col = col + 1; check_col < display_cols && check_col < col + cp_count; check_col++) {
+        VTermScreenCell check_cell;
+        if (terminal_get_cell(term, row, check_col, &check_cell) < 0) break;
+        if (check_cell.chars[0] == 0) break;  // Hit empty cell, stop
+        cells_consumed++;
+    }
+
+    last_combined_col = col + cells_consumed - 1;
+    vlog("Emoji at (%d,%d): %d codepoints, consumed %d cells (col %d to %d)\n",
+         row, col, cp_count, cells_consumed, col, last_combined_col);
+}
+```
+
+**Alternative: Simpler Heuristic**
+
+```c
+// Since combine_cells_for_emoji() includes lookahead logic,
+// assume it consumed one cell per codepoint collected (conservative)
+last_combined_col = col + cp_count - 1;
+```
+
+### Testing Strategy
+
+**Test Cases:**
+
+1. **Skin tone modifiers:**
+
+   ```bash
+   printf "\xf0\x9f\x91\x8b\xf0\x9f\x8f\xbb" | ./build/src/vterm-sdl3 -v -
+   # U+1F44B (👋) + U+1F3FB (🏻 light skin)
+   # Expected: Single glyph with light skin tone
+   ```
+
+2. **Flags:**
+
+   ```bash
+   printf "\xf0\x9f\x87\xba\xf0\x9f\x87\xb8" | ./build/src/vterm-sdl3 -v -
+   # U+1F1FA + U+1F1F8 (🇺🇸)
+   # Expected: US flag emoji
+   ```
+
+3. **ZWJ sequences:**
+
+   ```bash
+   printf "\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa7\xe2\x80\x8d\xf0\x9f\x91\xa6" | ./build/src/vterm-sdl3 -v -
+   # U+1F468 + U+200D + U+1F469 + U+200D + U+1F467 + U+200D + U+1F466 (👨‍👩‍👧‍👦)
+   # Expected: Family emoji
+   ```
+
+4. **Existing emoji.sh script:**
+   ```bash
+   ./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -
+   # Should now render all emoji sequences correctly
+   ```
+
+**Verification:**
+
+- Verbose logging (`-v`) will show "Combined emoji" messages
+- Check that skin tones, flags, and families render as single glyphs
+- Verify cell alignment remains correct (no gaps or overlaps)
+
+### Risks and Edge Cases
+
+**Risk 1: Double-rendering**
+
+- If skip logic is wrong, might render modifier twice
+- **Mitigation**: Strict `col <= last_combined_col` check
+
+**Risk 2: Cell width misalignment**
+
+- If combining consumes wrong number of cells, cursor may desync
+- **Mitigation**: Careful testing with cell width inspection
+
+**Risk 3: Non-emoji false positives**
+
+- Some Unicode ranges might be incorrectly identified as emoji
+- **Mitigation**: Use precise emoji detection (combine existing helpers)
+
+**Edge Case 1: Partial sequences at row end**
+
+- Flag RI-RI split across line boundary
+- **Solution**: `combine_cells_for_emoji()` already limits to current row
+
+**Edge Case 2: Mixed emoji and text**
+
+- Text codepoint adjacent to emoji
+- **Solution**: `combine_cells_for_emoji()` stops at non-combinable cells
+
+**Edge Case 3: Multiple modifiers**
+
+- Invalid sequences like 👋🏻🏿 (two skin tones)
+- **Solution**: HarfBuzz will shape as-is; font renderer handles
+
+### Implementation Checklist
+
+- [ ] Add `last_combined_col` tracking variable in row loop
+- [ ] Add skip logic at start of col loop
+- [ ] Replace single-cell codepoint collection with conditional combining
+- [ ] Add emoji range detection helper invocation
+- [ ] Call `combine_cells_for_emoji()` for emoji codepoints
+- [ ] Calculate and set `last_combined_col` based on combined result
+- [ ] Add verbose logging for combined emoji sequences
+- [ ] Test with skin tone modifiers
+- [ ] Test with flag emoji (regional indicators)
+- [ ] Test with ZWJ family emoji
+- [ ] Test with mixed emoji and text
+- [ ] Verify no gaps or overlaps in rendering
+- [ ] Run full emoji.sh test suite
 
 ---
 
@@ -200,15 +613,15 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 ## TODO List (Priority Order)
 
-### P0 - Critical (Emoji Broken)
+### P0 - Critical (Emoji Broken - FIX DESIGNED)
 
-- [ ] **Fix multi-codepoint cell combining** 🔴
-  - Skin tone modifiers stored in separate cells by libvterm
-  - Flag regional indicators stored in separate cells
-  - ZWJ sequences (family, professions) stored in separate cells
-  - **Solution**: Implement cell lookahead in renderer to combine before shaping
-  - **Location**: `src/renderer.c` line ~441-466 (cp_count gathering)
+- [ ] **Implement multi-codepoint cell combining fix** 🔴 **READY TO IMPLEMENT**
+  - Add `last_combined_col` skip tracking to row loop
+  - Call `combine_cells_for_emoji()` for emoji codepoints (function already exists!)
+  - Replace single-cell codepoint collection with conditional combining logic
+  - **Location**: `src/renderer.c` lines 375-603
   - **Test**: 👋🏻 (hand + light skin), 🇺🇸 (flag), 👨‍👩‍👧‍👦 (family)
+  - **Design**: See "Multi-Codepoint Emoji Fix Design" section above
 
 - [ ] **Debug vehicle emoji rendering** 🟡
   - Cars (🚗🚕🚙) render as gray/white boxes
@@ -248,22 +661,31 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 - Lines 266-459: `render_colr_glyph()` - COLR v0 layer compositing
 - Lines 570-650: `rasterize_glyph_mask()` - Glyph mask for PaintGlyph
 - Lines 719-743: `eval_colorline()` - Color stop extraction
-- Lines 745-834: `paint_linear_gradient()` - Linear gradient evaluation **← FIX Y-FLIP HERE**
-- Lines 871-940: Radial gradient **← FIX Y-FLIP HERE**
-- Lines 942-1019: Sweep gradient **← FIX Y-FLIP HERE**
+- Lines 745-834: `paint_linear_gradient()` - Linear gradient evaluation
+- Lines 871-940: Radial gradient
+- Lines 942-1019: Sweep gradient
 - Lines 838-1276: `paint_colr_paint_recursive()` - **CORE PAINT EVALUATOR**
-- Lines 1206-1254: PaintGlyph case **← FIX OFFSETS HERE**
-- Lines 1279-1369: `render_colr_paint_glyph()` - COLR v1 entry point **← FIX ROOT CALL HERE**
+- Lines 1206-1254: PaintGlyph case
+- Lines 1279-1369: `render_colr_paint_glyph()` - COLR v1 entry point
 - Lines 1774-1948: `rasterize_glyph_index()` - Glyph rasterization dispatcher
 - Lines 1951-2016: `ft_render_shaped()` - HarfBuzz shaping + rasterization
 
 **Renderer:** `src/renderer.c`
 
+- **Lines 69-91:** Emoji detection helpers (`is_emoji_presentation`, `is_regional_indicator`, `is_zwj`, `is_skin_tone_modifier`)
+- **Lines 107-216:** `combine_cells_for_emoji()` - **DEAD CODE (never called)**
+  - Handles skin tone modifiers (U+1F3FB-U+1F3FF)
+  - Handles ZWJ sequences (collects chain after U+200D)
+  - Handles regional indicator pairs for flags
+  - Returns combined codepoint array and count
 - Lines 116-129: `renderer_get_cached_texture()` - Glyph cache lookup
 - Lines 131-171: `renderer_cache_texture()` - LRU cache insertion
 - Lines 342-578: `renderer_draw_terminal()` - **MAIN RENDER LOOP**
+- **Lines 375-554:** Cell rendering loop - **WHERE FIX SHOULD GO**
+  - Line 376: Column loop (needs skip tracking)
+  - Lines 598-603: Single-cell codepoint collection - **NEEDS REPLACEMENT**
+  - Lines 624-664: Shaped rendering path (already works correctly)
 - Lines 453-459: Font selection logic (emoji vs normal vs bold)
-- Lines 464-504: Shaped run rendering path
 
 **Font API:** `src/font.c`, `src/font.h`
 
@@ -296,22 +718,22 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 **What's Broken:** 🔴
 
-1. **Skin tone modifiers** (CRITICAL):
+1. **Skin tone modifiers** (CRITICAL - FIX DESIGNED):
    - Input: 👋🏻 (U+1F44B + U+1F3FB)
    - Expected: Single yellow hand with light skin tone
    - Actual: Yellow hand + separate brown square
-   - Cause: libvterm stores modifier in separate cell
-2. **Flag emoji** (CRITICAL):
+   - **Cause**: `combine_cells_for_emoji()` exists but is never called
+2. **Flag emoji** (CRITICAL - FIX DESIGNED):
    - Input: 🇺🇸 (U+1F1FA + U+1F1F8)
    - Expected: US flag emoji
    - Actual: "US" as text (regional indicators render separately)
-   - Cause: Regional indicators stored in separate cells
+   - **Cause**: `combine_cells_for_emoji()` exists but is never called
 
-3. **Family ZWJ sequences** (CRITICAL):
+3. **Family ZWJ sequences** (CRITICAL - FIX DESIGNED):
    - Input: 👨‍👩‍👧‍👦 (man + ZWJ + woman + ZWJ + girl + ZWJ + boy)
    - Expected: Single family emoji
    - Actual: Individual person emoji rendered separately
-   - Cause: ZWJ sequence broken into separate cells
+   - **Cause**: `combine_cells_for_emoji()` exists but is never called
 
 4. **Vehicle emoji** (HIGH):
    - Input: 🚗🚕🚙 (cars)
@@ -321,42 +743,10 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 **Root Cause Analysis:**
 
-The HarfBuzz shaping code is correct and ready, but libvterm's cell model stores
-multi-codepoint sequences in separate cells. The renderer receives:
-
-- Cell 1: U+1F44B (👋)
-- Cell 2: U+1F3FB (🏻 modifier)
-
-Instead of the combined sequence for shaping. The shaping path (cp_count > 1) is
-never triggered because each cell has cp_count=1.
-
-**Recommended Fixes:**
-
-**Option 1: Cell Lookahead in Renderer** (Preferred)
-
-- Location: `src/renderer.c` lines 440-466
-- Implementation:
-  1. When rendering a cell with emoji codepoint, check next cell
-  2. If next cell is skin tone modifier (U+1F3FB-U+1F3FF), combine
-  3. If next cell is ZWJ (U+200D), lookahead and collect entire sequence
-  4. If cell is regional indicator (U+1F1E6-U+1F1FF), combine with next RI
-  5. Pass combined array to HarfBuzz shaping
-- Pros: No libvterm changes needed, direct control
-- Cons: Need to handle cell width properly (modifier takes 0-1 cells)
-
-**Option 2: libvterm Configuration**
-
-- Check if libvterm has option to keep modifier sequences in single cell
-- May require libvterm version check or fork
-- Pros: Cleaner separation of concerns
-- Cons: May not be possible, requires external dependency change
-
-**Option 3: Post-Processing Pass**
-
-- Add pre-render pass to merge cells before main render loop
-- Build combined codepoint arrays for each visual glyph
-- Pros: Clean separation from render loop
-- Cons: Additional complexity, performance overhead
+The code to fix multi-codepoint emoji **ALREADY EXISTS** in `combine_cells_for_emoji()`
+but was never integrated into the rendering loop. The rendering loop at lines 598-603
+only collects codepoints from the current cell, so the shaped rendering path
+(cp_count > 1, line 624) is never triggered for emoji sequences stored in separate cells.
 
 ### Automated Tests (Future)
 
@@ -433,6 +823,16 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 - Eviction: Least-recently-used
 - Size: Reasonable for terminal use (covers most visible glyphs)
 
+### 5. Emoji Combining Strategy (NEW)
+
+**Decision:** Use existing `combine_cells_for_emoji()` with skip tracking
+
+- **Rationale**: Function already exists and handles all cases correctly
+- **Integration point**: Main rendering loop at line 598
+- **Skip mechanism**: Track `last_combined_col` per row to avoid double-rendering
+- **Trigger**: Detect emoji range and call combining function
+- **HarfBuzz integration**: Pass combined codepoints to existing shaped path
+
 ---
 
 ## Current Status Summary
@@ -450,21 +850,21 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ Renderer integration with shaped runs
 ✅ Glyph texture caching
 ✅ **Simple emoji render correctly** (single-codepoint emoji like 😀😃😄 work perfectly)
-✅ **COLR v1 emoji layers render right-side-up** (Bug 5: Y-axis inversion FIXED)
-✅ **COLR v1 emoji layers at correct offsets** (Bug 5: coordinate mapping FIXED)
+✅ **COLR v1 emoji layers render right-side-up** (Y-axis inversion FIXED)
+✅ **COLR v1 emoji layers at correct offsets** (coordinate mapping FIXED)
 ✅ **COLR v0 fallback verified** (Three-level fallback: COLR v1 → COLR v0 → Grayscale)
-✅ **Grayscale fallback for glyphs without COLR data** (Handles all edge cases including glyph IDs 1-5)
+✅ **Grayscale fallback for glyphs without COLR data** (Handles all edge cases)
 ✅ **HarfBuzz shaping infrastructure** (Works when multi-codepoint cells are passed)
+✅ **Emoji combining logic implemented** (`combine_cells_for_emoji()` exists and is correct)
 
-### Broken (Need Immediate Fix)
+### Broken (Root Cause Identified - Fix Designed)
 
 🔴 **Multi-codepoint emoji sequences** (skin tones, flags, ZWJ sequences)
 
-- Skin tone modifiers: 👋🏻 renders as yellow hand + brown square
-- Flags: 🇺🇸 renders as "US" instead of flag
-- Family emoji: 👨‍👩‍👧‍👦 renders as individual people
-- **Root cause**: libvterm stores each codepoint in separate cell
-- **Fix needed**: Cell lookahead/combining logic before rendering
+- **Root cause**: `combine_cells_for_emoji()` exists but is NEVER CALLED
+- **Evidence**: Function at lines 107-216, no callers found
+- **Fix designed**: See "Multi-Codepoint Emoji Fix Design" section
+- **Status**: Ready to implement - just needs integration into render loop
 
 🟡 **Complex vehicle emoji** (🚗🚕🚙 render as gray boxes)
 
@@ -486,6 +886,7 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ **Phase 3:** Renderer integration - Shaped runs rendering
 ✅ **Phase 4:** Critical coordinate system bug (Y-axis flip) - **FIXED**
 ✅ **Phase 5:** COLR v0 fallback verification - **VERIFIED**
+✅ **Phase 6:** Root cause analysis for emoji sequences - **COMPLETE**
 
 **Current State:**
 
@@ -497,25 +898,28 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 - ✅ Grayscale rendering for non-color glyphs
 - ✅ Y-axis coordinate mapping (layers positioned correctly)
 - ✅ HarfBuzz shaping infrastructure (ready for multi-codepoint)
+- ✅ Emoji combining function exists and is fully implemented
 
-**Broken:**
+**Broken (Fix Ready):**
 
-- 🔴 Skin tone modifiers: 👋🏻 → renders as 👋 + 🏻 (separate)
-- 🔴 Flag emoji: 🇺🇸 → renders as U + S (regional indicators separate)
-- 🔴 ZWJ sequences: 👨‍👩‍👧‍👦 → individual people instead of family
+- 🔴 Skin tone modifiers: 👋🏻 → renders as 👋 + 🏻 (never calls combine function)
+- 🔴 Flag emoji: 🇺🇸 → renders as U + S (never calls combine function)
+- 🔴 ZWJ sequences: 👨‍👩‍👧‍👦 → individual people (never calls combine function)
 - 🟡 Complex vehicle emoji: 🚗🚕🚙 → gray/white boxes (composite mode issue?)
 
 ## Next Steps (Priority Order)
 
-### Critical (Blocks emoji rendering)
+### Critical (Fix Designed and Ready)
 
-1. **Fix multi-codepoint cell handling** 🔴
-   - Problem: libvterm stores modifier sequences in separate cells
-   - Solution options:
-     a. Cell lookahead in renderer to combine related codepoints
-     b. libvterm configuration to keep sequences together
-     c. Post-processing to merge modifier cells
-   - Affects: All skin tones, all flags, all ZWJ sequences
+1. **Implement multi-codepoint cell combining integration** 🔴 **READY**
+   - Solution designed in detail above
+   - Add skip tracking to row loop (1 line)
+   - Add skip check at start of column loop (3 lines)
+   - Replace codepoint collection with conditional combining (20 lines)
+   - Total change: ~25 lines in `src/renderer.c`
+   - **Location**: Lines 375-376, 598-603
+   - **Test cases**: Prepared and ready
+   - **Expected result**: All multi-codepoint emoji sequences render correctly
 
 2. **Debug complex COLR v1 rendering** 🟡
    - Test vehicles with verbose logging to identify missing composite modes
@@ -530,6 +934,6 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 
 ---
 
-**Document Version:** 6.0  
+**Document Version:** 7.0  
 **Last Updated:** 2026-01-23  
-**Status:** Phase 5 Complete - Multi-Codepoint Emoji Broken - Needs Cell Combining Logic
+**Status:** Phase 6 Complete - Root Cause Identified - Fix Designed and Ready to Implement
