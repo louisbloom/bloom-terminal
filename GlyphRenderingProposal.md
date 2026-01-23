@@ -14,52 +14,66 @@ This document tracks the redesign of the glyph rendering system to eliminate Cai
 
 ## Remaining Work
 
-### Immediate (Next Phase - Post Y-Axis Fix)
+### Immediate (Current Issues - Critical)
 
-1. **Verify COLR v0 fallback** In-Progress
-   - Some emoji glyphs don't have v1 paint graphs
-   - Fallback to COLR v0 layer rendering for these
-   - Handle edge case where glyph IDs 1-5 fail to get paint data
+1. **Fix ZWJ and multi-codepoint emoji rendering** 🔴 BROKEN
+   - **Issue**: Skin tone modifiers render as separate glyphs (👋 + 🏻 instead of 👋🏻)
+   - **Issue**: Flag emoji render as separate regional indicators (🇺 + 🇸 instead of 🇺🇸)
+   - **Issue**: Family emoji render as individual people instead of combined group
+   - **Root cause**: libvterm stores multi-codepoint sequences in separate cells
+   - **Solution needed**: Cell combining logic or lookahead to group related codepoints
+   - **Affected**: Skin tones, flags, ZWJ sequences (family, professions, etc.)
+   - **Status**: Shaping code works when cp_count > 1, but cells arrive individually
 
-2. **Extended emoji testing**
-   - Test ZWJ sequences (family emoji, flags) with HarfBuzz shaping
-   - Verify skin tone modifiers work correctly
-   - Test complex color gradients in emoji
+2. **Debug complex COLR v1 rendering issues** 🟡 PARTIAL
+   - **Issue**: Some vehicle emoji (🚗🚕🚙) render as gray/white boxes
+   - **Issue**: Some composite modes may not be rendering correctly
+   - **Possible causes**: Missing composite operators, PaintExtend modes, or gradient issues
+   - **Test case**: `./examples/unicode/emoji.sh | ./build/src/vterm-sdl3 -v -`
+   - **Status**: Simple emoji work, complex gradients/composites may have issues
+
+3. **Verify COLR v0 fallback** ✅ COMPLETE
+   - Some emoji glyphs don't have v1 paint graphs → Falls back to COLR v0
+   - COLR v0 layer rendering handles all fonts with v0 data → Returns NULL if no layers
+   - Edge case where glyph IDs 1-5 fail to get paint data → Falls through to grayscale
+   - Fallback chain verified: COLR v1 → COLR v0 → Grayscale rasterization
+   - Added explicit logging for each fallback level
 
 ### Secondary (Correctness & Coverage)
 
-3. **Implement remaining composite modes**
-   - Currently implemented: SRC_OVER, PLUS, MULTIPLY
-   - Missing: SCREEN, OVERLAY, DARKEN, LIGHTEN, COLOR_DODGE, COLOR_BURN, HARD_LIGHT, SOFT_LIGHT, DIFFERENCE, EXCLUSION, HUE, SATURATION, COLOR, LUMINOSITY, SRC, DEST, SRC_IN, SRC_OUT, DEST_IN, DEST_OUT, SRC_ATOP, DEST_ATOP, XOR
+4. **Implement remaining composite modes**
+   - Currently implemented: SRC_OVER, PLUS, MULTIPLY, SCREEN, OVERLAY, DARKEN, LIGHTEN
+   - Missing: COLOR_DODGE, COLOR_BURN, HARD_LIGHT, SOFT_LIGHT, DIFFERENCE, EXCLUSION, HUE, SATURATION, COLOR, LUMINOSITY, SRC, DEST, SRC_IN, SRC_OUT, DEST_IN, DEST_OUT, SRC_ATOP, DEST_ATOP, XOR
    - Refer to FreeType ftcolor.h `FT_Composite_Mode` enum (line 446-479)
+   - **Priority**: May fix vehicle emoji rendering issues
 
-4. **Implement PaintExtend modes**
+5. **Implement PaintExtend modes**
    - Currently: Only PAD is implemented (clamp to [0,1])
    - Missing: REPEAT, REFLECT
    - Location: `eval_colorline()` should return extend mode; gradient functions should apply it
    - Apply to t-value calculation in gradients before color interpolation
 
-5. **Optimize gradient evaluation**
+6. **Optimize gradient evaluation**
    - Current: Per-pixel CPU gradient evaluation
    - Consider: GPU shader-based gradients or FreeType internal rasterization
 
 ### Nice-to-Have (Future Enhancements)
 
-6. **Font fallback chain**
+7. **Font fallback chain**
    - Current: Single emoji font selected via fontconfig "emoji" pattern
    - Improvement: Fallback to multiple fonts for broader Unicode coverage
 
-7. **BiDi/RTL support**
+8. **BiDi/RTL support**
    - Use HarfBuzz direction/script detection
    - Implement proper RTL shaping
 
-8. **Texture atlas**
+9. **Texture atlas**
    - Current: Per-glyph SDL_Texture with LRU cache
    - Optimization: Pack glyphs into atlas texture for batch rendering
 
-9. **Extended variable font axes**
-   - Current: Weight (wght) supported
-   - Add: Width (wdth), Slant (slnt), Italic (ital), Optical Size (opsz), Grade (GRAD)
+10. **Extended variable font axes**
+    - Current: Weight (wght) supported
+    - Add: Width (wdth), Slant (slnt), Italic (ital), Optical Size (opsz), Grade (GRAD)
 
 ---
 
@@ -186,16 +200,32 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 ## TODO List (Priority Order)
 
-### P1 - High (Coverage)
+### P0 - Critical (Emoji Broken)
 
-- [ ] **Handle COLR v0 fallback:** When v1 paint graph not found, ensure `FT_Get_Color_Glyph_Layer` path works
-- [ ] **Emoji ZWJ sequences:** Ensure HarfBuzz shaping handles multi-codepoint emoji (family, flag sequences)
-- [ ] **Add logging:** Log paint coordinate transformations for debugging Y-flip
+- [ ] **Fix multi-codepoint cell combining** 🔴
+  - Skin tone modifiers stored in separate cells by libvterm
+  - Flag regional indicators stored in separate cells
+  - ZWJ sequences (family, professions) stored in separate cells
+  - **Solution**: Implement cell lookahead in renderer to combine before shaping
+  - **Location**: `src/renderer.c` line ~441-466 (cp_count gathering)
+  - **Test**: 👋🏻 (hand + light skin), 🇺🇸 (flag), 👨‍👩‍👧‍👦 (family)
+
+- [ ] **Debug vehicle emoji rendering** 🟡
+  - Cars (🚗🚕🚙) render as gray/white boxes
+  - May be missing composite modes or PaintExtend issues
+  - **Debug**: Add verbose logging to identify which paint operations fail
+  - **Test**: ./examples/unicode/emoji.sh | ./build/src/vterm-sdl3 -v -
+
+### P1 - High (Already Complete)
+
+- [x] **Handle COLR v0 fallback:** ✅ COMPLETE - Three-level fallback working
+- [x] **Add logging:** ✅ COMPLETE - Fallback transitions logged
+- [x] **Y-axis coordinate fix:** ✅ COMPLETE - Layers render correctly
 
 ### P2 - Medium (Features)
 
 - [ ] **Implement PaintExtend:** REPEAT and REFLECT modes in gradients
-- [ ] **Implement more composite modes:** Start with SCREEN, XOR, SRC_IN, DEST_IN
+- [ ] **Implement more composite modes:** COLOR_DODGE, HARD_LIGHT, SOFT_LIGHT, etc.
 - [ ] **Optimize gradient evaluation:** Consider caching or GPU-based rendering
 
 ### P3 - Low (Optimization & Polish)
@@ -246,28 +276,87 @@ DEBUG: FT_Get_Color_Glyph_Paint failed for glyph 1 (both INCLUDE_ROOT_TRANSFORM 
 
 ## Testing Strategy
 
-### Manual Tests (Current)
+### Test Results (2026-01-23)
+
+**Test Command:**
 
 ```bash
-# Emoji rendering test (currently shows offset/flip issues)
-./examples/unicode/emoji.sh | timeout 2 ./build/src/vterm-sdl3 -v -
-
-# Verbose logging shows:
-# - Font resolution (Noto Color Emoji found)
-# - COLR table detection (has_colr=1)
-# - Paint rendering attempts
-# - Bounding box dimensions (should be reasonable, e.g., 24x40)
+./examples/unicode/emoji.sh | ./build/src/vterm-sdl3 -v -
 ```
 
-### After Bug 5 Fixes
+**What Works:** ✅
 
-Expected behavior:
+- Simple emoji (single codepoint): 😀😃😄😁😆😅😂🤣😊😇 → Perfect
+- Animals: 🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯 → Render correctly
+- Food: 🍎🍐🍊🍋🍌🍉🍇🍓🍈🍒 → Render correctly
+- Most objects: ⚡💻📱 → Render correctly
+- Y-axis coordinate mapping: All simple emoji right-side-up and positioned correctly
+- COLR v1 paint traversal: Gradients and transforms work
+- COLR v0 fallback: Verified working when needed
 
-- Emoji glyphs should render at correct size (~24-40 pixel dimensions)
-- All layers should be right-side-up (no vertical flipping)
-- Layers should align correctly (no offset errors)
-- Gradients should render with correct orientation
-- COLR v1 paint path should produce correctly positioned, colorful emoji bitmaps
+**What's Broken:** 🔴
+
+1. **Skin tone modifiers** (CRITICAL):
+   - Input: 👋🏻 (U+1F44B + U+1F3FB)
+   - Expected: Single yellow hand with light skin tone
+   - Actual: Yellow hand + separate brown square
+   - Cause: libvterm stores modifier in separate cell
+2. **Flag emoji** (CRITICAL):
+   - Input: 🇺🇸 (U+1F1FA + U+1F1F8)
+   - Expected: US flag emoji
+   - Actual: "US" as text (regional indicators render separately)
+   - Cause: Regional indicators stored in separate cells
+
+3. **Family ZWJ sequences** (CRITICAL):
+   - Input: 👨‍👩‍👧‍👦 (man + ZWJ + woman + ZWJ + girl + ZWJ + boy)
+   - Expected: Single family emoji
+   - Actual: Individual person emoji rendered separately
+   - Cause: ZWJ sequence broken into separate cells
+
+4. **Vehicle emoji** (HIGH):
+   - Input: 🚗🚕🚙 (cars)
+   - Expected: Colorful vehicle emoji
+   - Actual: Gray/white boxes
+   - Cause: Unknown - possibly missing composite modes or PaintExtend
+
+**Root Cause Analysis:**
+
+The HarfBuzz shaping code is correct and ready, but libvterm's cell model stores
+multi-codepoint sequences in separate cells. The renderer receives:
+
+- Cell 1: U+1F44B (👋)
+- Cell 2: U+1F3FB (🏻 modifier)
+
+Instead of the combined sequence for shaping. The shaping path (cp_count > 1) is
+never triggered because each cell has cp_count=1.
+
+**Recommended Fixes:**
+
+**Option 1: Cell Lookahead in Renderer** (Preferred)
+
+- Location: `src/renderer.c` lines 440-466
+- Implementation:
+  1. When rendering a cell with emoji codepoint, check next cell
+  2. If next cell is skin tone modifier (U+1F3FB-U+1F3FF), combine
+  3. If next cell is ZWJ (U+200D), lookahead and collect entire sequence
+  4. If cell is regional indicator (U+1F1E6-U+1F1FF), combine with next RI
+  5. Pass combined array to HarfBuzz shaping
+- Pros: No libvterm changes needed, direct control
+- Cons: Need to handle cell width properly (modifier takes 0-1 cells)
+
+**Option 2: libvterm Configuration**
+
+- Check if libvterm has option to keep modifier sequences in single cell
+- May require libvterm version check or fork
+- Pros: Cleaner separation of concerns
+- Cons: May not be possible, requires external dependency change
+
+**Option 3: Post-Processing Pass**
+
+- Add pre-render pass to merge cells before main render loop
+- Build combined codepoint arrays for each visual glyph
+- Pros: Clean separation from render loop
+- Cons: Additional complexity, performance overhead
 
 ### Automated Tests (Future)
 
@@ -360,17 +449,33 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ Affine transforms (Translate, Scale, Rotate, Skew, Transform)
 ✅ Renderer integration with shaped runs
 ✅ Glyph texture caching
-✅ **Emoji glyphs render at correct size with correct positioning** (all Y-axis bugs fixed)
+✅ **Simple emoji render correctly** (single-codepoint emoji like 😀😃😄 work perfectly)
 ✅ **COLR v1 emoji layers render right-side-up** (Bug 5: Y-axis inversion FIXED)
 ✅ **COLR v1 emoji layers at correct offsets** (Bug 5: coordinate mapping FIXED)
+✅ **COLR v0 fallback verified** (Three-level fallback: COLR v1 → COLR v0 → Grayscale)
+✅ **Grayscale fallback for glyphs without COLR data** (Handles all edge cases including glyph IDs 1-5)
+✅ **HarfBuzz shaping infrastructure** (Works when multi-codepoint cells are passed)
 
-### Incomplete (Need Work)
+### Broken (Need Immediate Fix)
 
-⚠️ COLR v0 fallback for fonts without v1 paint graphs
-⚠️ Handle glyph IDs that don't have COLR data (multi-layer composites)
-⚠️ PaintExtend modes (REPEAT, REFLECT)
-⚠️ Many composite operators
-⚠️ Some gradient edge cases
+🔴 **Multi-codepoint emoji sequences** (skin tones, flags, ZWJ sequences)
+
+- Skin tone modifiers: 👋🏻 renders as yellow hand + brown square
+- Flags: 🇺🇸 renders as "US" instead of flag
+- Family emoji: 👨‍👩‍👧‍👦 renders as individual people
+- **Root cause**: libvterm stores each codepoint in separate cell
+- **Fix needed**: Cell lookahead/combining logic before rendering
+
+🟡 **Complex vehicle emoji** (🚗🚕🚙 render as gray boxes)
+
+- Likely missing composite modes or PaintExtend issues
+- Simple emoji work, complex paint graphs may have problems
+
+### Incomplete (Lower Priority)
+
+⚠️ PaintExtend modes (REPEAT, REFLECT) - currently only PAD (clamp) is implemented
+⚠️ Additional composite operators (may fix vehicle rendering)
+⚠️ Gradient edge cases and performance optimization
 
 ---
 
@@ -380,24 +485,51 @@ hb_buffer_get_glyph_positions()  // Get positions (26.6 fixed-point)
 ✅ **Phase 2:** HarfBuzz integration - Text shaping support  
 ✅ **Phase 3:** Renderer integration - Shaped runs rendering
 ✅ **Phase 4:** Critical coordinate system bug (Y-axis flip) - **FIXED**
+✅ **Phase 5:** COLR v0 fallback verification - **VERIFIED**
 
-**Result:** COLR v1 emoji rendering now works correctly with:
+**Current State:**
 
-- Layers positioned accurately
-- Right-side-up rendering (no vertical flips)
-- Correct gradient orientation
-- Proper affine transforms
-- All layers composited in correct order
+**Working:**
 
-## Next Steps (Secondary Improvements)
+- ✅ Simple emoji (single codepoint): 😀😃😄😁😆😅😂🤣 render perfectly
+- ✅ COLR v1 paint graphs with gradients and transforms
+- ✅ COLR v0 layer compositing with proper fallback
+- ✅ Grayscale rendering for non-color glyphs
+- ✅ Y-axis coordinate mapping (layers positioned correctly)
+- ✅ HarfBuzz shaping infrastructure (ready for multi-codepoint)
 
-1. **Extend coverage:** Implement COLR v0 fallback and missing composite modes
-2. **Performance:** GPU-based gradient evaluation, texture atlasing
-3. **Features:** Implement PaintExtend REPEAT/REFLECT modes
-4. **Testing:** Comprehensive emoji test suite with golden images
+**Broken:**
+
+- 🔴 Skin tone modifiers: 👋🏻 → renders as 👋 + 🏻 (separate)
+- 🔴 Flag emoji: 🇺🇸 → renders as U + S (regional indicators separate)
+- 🔴 ZWJ sequences: 👨‍👩‍👧‍👦 → individual people instead of family
+- 🟡 Complex vehicle emoji: 🚗🚕🚙 → gray/white boxes (composite mode issue?)
+
+## Next Steps (Priority Order)
+
+### Critical (Blocks emoji rendering)
+
+1. **Fix multi-codepoint cell handling** 🔴
+   - Problem: libvterm stores modifier sequences in separate cells
+   - Solution options:
+     a. Cell lookahead in renderer to combine related codepoints
+     b. libvterm configuration to keep sequences together
+     c. Post-processing to merge modifier cells
+   - Affects: All skin tones, all flags, all ZWJ sequences
+
+2. **Debug complex COLR v1 rendering** 🟡
+   - Test vehicles with verbose logging to identify missing composite modes
+   - Check if PaintExtend REPEAT/REFLECT are needed
+   - Verify gradient evaluations are correct
+
+### Secondary (Correctness)
+
+3. **Implement missing composite modes** (COLOR_DODGE, HARD_LIGHT, etc.)
+4. **Implement PaintExtend REPEAT/REFLECT**
+5. **Performance optimization** (GPU gradients, texture atlas)
 
 ---
 
-**Document Version:** 5.0  
+**Document Version:** 6.0  
 **Last Updated:** 2026-01-23  
-**Status:** Phase 4 Complete - COLR v1 Emoji Rendering FIXED - Y-Axis Coordinate Bug Resolved
+**Status:** Phase 5 Complete - Multi-Codepoint Emoji Broken - Needs Cell Combining Logic

@@ -1893,6 +1893,7 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
             vlog("rasterize_glyph_index: COLR v1 paint rendered for glyph %u: %dx%d\n", glyph_index, colr_p->width, colr_p->height);
             return colr_p;
         }
+        vlog("rasterize_glyph_index: COLR v1 paint not available for glyph %u, trying COLR v0 fallback\n", glyph_index);
         // Fallback to COLR v0 layer rendering
         GlyphBitmap *colr = render_colr_glyph(ft_data, glyph_index, fg_r, fg_g, fg_b);
         if (colr) {
@@ -1900,6 +1901,7 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
             return colr;
         }
         // Otherwise fall back to grayscale rasterization below
+        vlog("rasterize_glyph_index: COLR v0 also not available for glyph %u, falling back to grayscale\n", glyph_index);
     }
 
     FT_Face face = ft_data->ft_face;
@@ -2052,6 +2054,7 @@ static GlyphBitmap *rasterize_glyph_index(FtFontData *ft_data, FT_UInt glyph_ind
         return NULL;
     }
 
+    vlog("rasterize_glyph_index: Grayscale fallback rendered for glyph %u: %dx%d\n", glyph_index, glyph_bitmap->width, glyph_bitmap->height);
     return glyph_bitmap;
 }
 
